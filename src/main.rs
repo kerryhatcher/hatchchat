@@ -140,6 +140,8 @@ async fn run_node(
     let cached_count = peer_cache.all_peers().map(|p| p.len()).unwrap_or(0);
     tracing::info!("Peer cache has {cached_count} cached peers");
 
+    let _ = ui_tx.send(UiEvent::CacheCount(cached_count));
+
     // Send initial info to the TUI.
     let _ = ui_tx.send(UiEvent::Info(format!("Local PeerId: {peer_id}")));
     let _ = ui_tx.send(UiEvent::Info(format!(

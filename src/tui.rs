@@ -65,6 +65,8 @@ pub enum UiEvent {
     RelayEvent(String),
     /// DHT discovery result.
     DhtRecord(String),
+    /// Number of peers currently in the persistent cache.
+    CacheCount(usize),
 }
 
 /// Actions sent from the TUI thread → swarm task.
@@ -322,6 +324,9 @@ fn handle_ui_event(state: &mut TuiState, event: UiEvent) {
         }
         UiEvent::RelayEvent(msg) => add_event(state, &format!("Relay: {msg}"), EventKind::Info),
         UiEvent::DhtRecord(msg) => add_event(state, &format!("DHT: {msg}"), EventKind::Info),
+        UiEvent::CacheCount(n) => {
+            state.cache_count = n;
+        }
     }
 }
 
