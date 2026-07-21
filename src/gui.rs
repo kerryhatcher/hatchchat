@@ -6,9 +6,16 @@
 #![cfg(feature = "gui")]
 
 use crate::tui::{UiEvent, UserAction};
+use libp2p::PeerId;
 use macroquad::prelude::*;
+use ply_engine::prelude::*;
 use std::sync::mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
+
+static DEFAULT_FONT: FontAsset = FontAsset::Bytes {
+    file_name: "JetBrainsMono-Regular.ttf",
+    data: include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+};
 
 #[derive(Clone)]
 enum EventKind { System, Chat, Warn, Info }
@@ -129,15 +136,18 @@ pub fn run_gui(
 async fn gui_main(
     ui_rx: mpsc::Receiver<UiEvent>,
     action_tx: tokio_mpsc::Sender<UserAction>,
-    _our_peer_id: String,
+    our_peer_id: String,
 ) {
     // Cooperate with the OS close button instead of hard-exiting.
     prevent_quit();
+    let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
+    let mut state = GuiState::new(our_peer_id);
+
     loop {
-        // Drain swarm events (stub: discard; Task 5 renders them).
+        // 1. Drain swarm events into state.
         loop {
             match ui_rx.try_recv() {
-                Ok(_ev) => {}
+                Ok(ev) => apply_ui_event(&mut state, ev),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let _ = action_tx.try_send(UserAction::Quit);
@@ -147,12 +157,118 @@ async fn gui_main(
         }
 
         clear_background(BLACK);
-        draw_text("hatch-chat GUI — loading (stub)", 20.0, 40.0, 28.0, WHITE);
 
+        // 2. Build the UI tree.
+        let mut ui = ply.begin();
+        ui.element().width(grow!()).height(grow!())
+            .layout(|l| l.direction(LeftToRight).gap(8).padding(8))
+            .children(|ui| {
+                // Left column: event log (scroll) + input.
+                ui.element().width(fixed!(650.0)).height(grow!())
+                    .layout(|l| l.direction(TopToBottom).gap(8))
+                    .children(|ui| {
+                        // Scrollable log.
+                        ui.element().width(grow!()).height(grow!())
+                            .background_color(0x1A1A1A)
+                            .layout(|l| l.direction(TopToBottom).gap(4).padding(8))
+                            .overflow(|o| o.scroll_y().scrollbar(|s| s.width(4.0).thumb_color(0x666666).track_color(0x222222)))
+                            .children(|ui| {
+                                for entry in &state.events {
+                                    let color = match entry.kind {
+                                        EventKind::System => 0x66CCFF,
+                                        EventKind::Chat => 0x66FF88,
+                                        EventKind::Warn => 0xFFCC44,
+                                        EventKind::Info => 0xAAAAAA,
+                                    };
+                                    ui.text(&entry.text, |t| t.font_size(18).color(color));
+                                }
+                            });
+                        // Input box (hand-rolled — render state.input as text; cursor is a trailing '_').
+                        ui.element().width(grow!()).height(fixed!(40.0))
+                            .background_color(0x000000)
+                            .layout(|l| l.padding(8).align(Left, CenterY))
+                            .children(|ui| {
+                                ui.text(&format!("> {}_", state.input), |t| t.font_size(20).color(0xFFFFFF));
+                            });
+                    });
+
+                // Right column: connected + discovered + status.
+                ui.element().width(grow!()).height(grow!())
+                    .layout(|l| l.direction(TopToBottom).gap(8))
+                    .children(|ui| {
+                        // Connected peers (selectable).
+                        ui.element().width(grow!()).height(fixed!(220.0))
+                            .background_color(0x1A1A1A)
+                            .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
+                            .overflow(|o| o.scroll_y())
+                            .children(|ui| {
+                                ui.text("Peers (connected)", |t| t.font_size(16).color(0xFFFFFF));
+                                for (i, p) in state.connected_peers.iter().enumerate() {
+                                    let tag = if p.direct { "D" } else { "R" };
+                                    let sel = i == state.selected_peer;
+                                    let color = if sel { 0xFFFF66 } else { 0xCCCCCC };
+                                    ui.text(&format!("{tag} {}", short_pid(&p.peer_id)), |t| t.font_size(16).color(color));
+                                }
+                            });
+                        // Discovered.
+                        ui.element().width(grow!()).height(fixed!(160.0))
+                            .background_color(0x1A1A1A)
+                            .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
+                            .overflow(|o| o.scroll_y())
+                            .children(|ui| {
+                                ui.text("Discovered", |t| t.font_size(16).color(0xFFFFFF));
+                                for p in &state.discovered_peers {
+                                    ui.text(&format!("{} ({})", short_pid(&p.peer_id), p.source), |t| t.font_size(16).color(0xAAAAAA));
+                                }
+                            });
+                        // Status.
+                        ui.element().width(grow!()).height(grow!())
+                            .background_color(0x1A1A1A)
+                            .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
+                            .children(|ui| {
+                                ui.text("Status", |t| t.font_size(16).color(0xFFFFFF));
+                                ui.text(&format!("PeerId: {}", short_pid(&state.our_peer_id)), |t| t.font_size(14).color(0xCCCCCC));
+                                ui.text(&format!("NAT: {}", state.nat_status), |t| t.font_size(14).color(0xCCCCCC));
+                                ui.text(&format!("Peers: {} connected", state.connected_peers.len()), |t| t.font_size(14).color(0xCCCCCC));
+                                ui.text(&format!("Cache: {} peers", state.cache_count), |t| t.font_size(14).color(0xCCCCCC));
+                                ui.text("Enter=send  Shift+Enter=broadcast  Tab=next peer  Esc=quit", |t| t.font_size(12).color(0x777777));
+                            });
+                    });
+            });
+        ui.show(|_| {}).await;
+
+        // 3. Hand-rolled text input (rustywx pattern; cookbook §7/§9).
+        //    Append printable chars; Backspace deletes. Filter control chars
+        //    (Enter/Backspace arrive here too on some platforms).
+        while let Some(c) = get_char_pressed() {
+            if !c.is_control() {
+                state.input.push(c);
+            }
+        }
+        if is_key_pressed(KeyCode::Backspace) {
+            state.input.pop();
+        }
+
+        // 4. Keyboard actions (macroquad key APIs).
+        let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+        if is_key_pressed(KeyCode::Tab) && !state.connected_peers.is_empty() {
+            state.selected_peer = (state.selected_peer + 1) % state.connected_peers.len();
+        }
+        if is_key_pressed(KeyCode::Enter) && !state.input.is_empty() {
+            let text = std::mem::take(&mut state.input);
+            if shift {
+                let _ = action_tx.try_send(UserAction::Broadcast { text });
+            } else if let Some(p) = state.connected_peers.get(state.selected_peer) {
+                if let Ok(pid) = p.peer_id.parse::<PeerId>() {
+                    let _ = action_tx.try_send(UserAction::SendMessage { peer_id: pid, text });
+                }
+            }
+        }
         if is_key_pressed(KeyCode::Escape) || is_quit_requested() {
             let _ = action_tx.try_send(UserAction::Quit);
             return;
         }
+
         next_frame().await;
     }
 }
