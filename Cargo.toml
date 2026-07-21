@@ -2,6 +2,12 @@
 name = "hatch-chat"
 version = "0.6.0"
 edition = "2021"
+description = "Hearty peer-to-peer chat over libp2p, with a terminal UI (default) and an optional ply-engine desktop GUI."
+license = "MIT"
+repository = "https://github.com/kerryhatcher/hatchchat"
+readme = "README.md"
+keywords = ["p2p", "chat", "libp2p", "tui", "gui"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 libp2p = { version = "0.54", features = [
