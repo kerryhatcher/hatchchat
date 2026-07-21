@@ -28,6 +28,9 @@ struct ConnPeer { peer_id: String, addr: String, direct: bool }
 struct DiscPeer { peer_id: String, addr: String, source: String }
 
 struct GuiState {
+    /// Chat messages only. Capped separately so event spam can't evict chat.
+    chat: Vec<LogEntry>,
+    /// System / info / warning event log (everything that isn't chat).
     events: Vec<LogEntry>,
     connected_peers: Vec<ConnPeer>,
     discovered_peers: Vec<DiscPeer>,
@@ -41,6 +44,7 @@ struct GuiState {
 impl GuiState {
     fn new(our_peer_id: String) -> Self {
         Self {
+            chat: Vec::new(),
             events: Vec::new(),
             connected_peers: Vec::new(),
             discovered_peers: Vec::new(),
@@ -53,9 +57,15 @@ impl GuiState {
     }
 
     fn push(&mut self, text: String, kind: EventKind) {
-        self.events.push(LogEntry { text, kind });
-        if self.events.len() > 1000 {
-            self.events.remove(0);
+        // Route chat to its own buffer so system-event spam can't evict it.
+        let entry = LogEntry { text, kind: kind.clone() };
+        let (buf, cap) = match kind {
+            EventKind::Chat => (&mut self.chat, 1000),
+            _ => (&mut self.events, 500),
+        };
+        buf.push(entry);
+        if buf.len() > cap {
+            buf.remove(0);
         }
     }
 }
@@ -173,20 +183,15 @@ async fn gui_main(
                 ui.element().width(fixed!(650.0)).height(grow!())
                     .layout(|l| l.direction(TopToBottom).gap(8))
                     .children(|ui| {
-                        // Scrollable log.
+                        // Scrollable chat log (chat messages only).
                         ui.element().width(grow!()).height(grow!())
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(4).padding(8))
                             .overflow(|o| o.scroll_y().scrollbar(|s| s.width(4.0).thumb_color(0x666666).track_color(0x222222)))
                             .children(|ui| {
-                                for entry in &state.events {
-                                    let color = match entry.kind {
-                                        EventKind::System => 0x66CCFF,
-                                        EventKind::Chat => 0x66FF88,
-                                        EventKind::Warn => 0xFFCC44,
-                                        EventKind::Info => 0xAAAAAA,
-                                    };
-                                    ui.text(&entry.text, |t| t.font_size(18).color(color));
+                                ui.text("Chat", |t| t.font_size(16).color(0xFFFFFF));
+                                for entry in &state.chat {
+                                    ui.text(&entry.text, |t| t.font_size(18).color(0x66FF88));
                                 }
                             });
                         // Input box (hand-rolled — render state.input as text; cursor is a trailing '_').
@@ -198,12 +203,12 @@ async fn gui_main(
                             });
                     });
 
-                // Right column: connected + discovered + status.
+                // Right column: connected + discovered + status + events.
                 ui.element().width(grow!()).height(grow!())
                     .layout(|l| l.direction(TopToBottom).gap(8))
                     .children(|ui| {
                         // Connected peers (selectable).
-                        ui.element().width(grow!()).height(fixed!(220.0))
+                        ui.element().width(grow!()).height(fixed!(180.0))
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
                             .overflow(|o| o.scroll_y())
@@ -217,7 +222,7 @@ async fn gui_main(
                                 }
                             });
                         // Discovered.
-                        ui.element().width(grow!()).height(fixed!(160.0))
+                        ui.element().width(grow!()).height(fixed!(140.0))
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
                             .overflow(|o| o.scroll_y())
@@ -228,7 +233,7 @@ async fn gui_main(
                                 }
                             });
                         // Status.
-                        ui.element().width(grow!()).height(grow!())
+                        ui.element().width(grow!()).height(fixed!(150.0))
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
                             .children(|ui| {
@@ -238,6 +243,23 @@ async fn gui_main(
                                 ui.text(&format!("Peers: {} connected", state.connected_peers.len()), |t| t.font_size(14).color(0xCCCCCC));
                                 ui.text(&format!("Cache: {} peers", state.cache_count), |t| t.font_size(14).color(0xCCCCCC));
                                 ui.text("Enter=send  Shift+Enter=broadcast  Tab=next peer  Esc=quit", |t| t.font_size(12).color(0x777777));
+                            });
+                        // Events log (system / info / warnings — kept out of chat).
+                        ui.element().width(grow!()).height(grow!())
+                            .background_color(0x1A1A1A)
+                            .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
+                            .overflow(|o| o.scroll_y().scrollbar(|s| s.width(4.0).thumb_color(0x666666).track_color(0x222222)))
+                            .children(|ui| {
+                                ui.text("Events", |t| t.font_size(16).color(0xFFFFFF));
+                                for entry in &state.events {
+                                    let color = match entry.kind {
+                                        EventKind::System => 0x66CCFF,
+                                        EventKind::Chat => 0x66FF88,
+                                        EventKind::Warn => 0xFFCC44,
+                                        EventKind::Info => 0xAAAAAA,
+                                    };
+                                    ui.text(&entry.text, |t| t.font_size(14).color(color));
+                                }
                             });
                     });
             });
@@ -311,16 +333,32 @@ mod tests {
         apply_ui_event(&mut s, UiEvent::PeerDisconnected { peer_id: "12D3KooWabc".into() });
         assert_eq!(s.connected_peers.len(), 0);
 
+        // Chat goes to the chat buffer, not the event log.
         apply_ui_event(&mut s, UiEvent::ChatMessage { from: "bob".into(), text: "hi".into() });
-        assert!(s.events.last().unwrap().text.contains("hi"));
+        assert!(s.chat.last().unwrap().text.contains("hi"));
+        // The preceding system events landed in the event buffer, not chat.
+        assert_eq!(s.chat.len(), 1);
+        assert!(!s.events.is_empty());
     }
 
     #[test]
     fn event_log_is_capped() {
         let mut s = GuiState::new("me".to_string());
-        for i in 0..1100 {
+        for i in 0..600 {
             apply_ui_event(&mut s, UiEvent::Info(format!("line {i}")));
         }
-        assert!(s.events.len() <= 1000);
+        assert!(s.events.len() <= 500);
+    }
+
+    #[test]
+    fn chat_and_events_are_separate() {
+        let mut s = GuiState::new("me".to_string());
+        for i in 0..1100 {
+            apply_ui_event(&mut s, UiEvent::Info(format!("evt {i}")));
+        }
+        apply_ui_event(&mut s, UiEvent::ChatMessage { from: "a".into(), text: "hello".into() });
+        // Event spam is capped at 500 and never touches the chat buffer.
+        assert!(s.events.len() <= 500);
+        assert_eq!(s.chat.len(), 1);
     }
 }

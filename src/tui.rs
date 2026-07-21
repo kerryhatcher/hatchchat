@@ -117,7 +117,10 @@ struct DiscoveredPeer {
 
 /// All state owned by the TUI thread.
 struct TuiState {
-    /// Pre-formatted, styled log lines.
+    /// Chat messages only (from peers and us). Capped separately so system
+    /// event spam can never evict chat history.
+    chat: Vec<Line<'static>>,
+    /// System / info / warning event log (everything that isn't chat).
     events: Vec<Line<'static>>,
     connected_peers: Vec<ConnectedPeer>,
     discovered_peers: Vec<DiscoveredPeer>,
@@ -162,6 +165,7 @@ pub fn run_tui(
     let mut terminal: Terminal<_> = Terminal::new(backend)?;
 
     let mut state = TuiState {
+        chat: Vec::new(),
         events: Vec::new(),
         connected_peers: Vec::new(),
         discovered_peers: Vec::new(),
@@ -227,10 +231,14 @@ fn add_event(state: &mut TuiState, text: &str, kind: EventKind) {
         Span::styled(text.to_string(), Style::default().fg(color)),
     ]);
 
-    state.events.push(line);
-    // Cap at 1000 entries to bound memory.
-    if state.events.len() > 1000 {
-        state.events.remove(0);
+    // Route chat to its own buffer so system-event spam can't evict it.
+    let (buf, cap) = match kind {
+        EventKind::Chat => (&mut state.chat, 1000),
+        _ => (&mut state.events, 500),
+    };
+    buf.push(line);
+    if buf.len() > cap {
+        buf.remove(0);
     }
 }
 
@@ -456,43 +464,56 @@ fn render(f: &mut Frame, state: &TuiState) {
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(left_area);
 
-    let events_area = left_chunks[0];
+    let chat_area = left_chunks[0];
     let input_area = left_chunks[1];
 
-    // Right vertical: [connected, discovered, status]
+    // Right vertical: [connected, discovered, status, events]
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(40),
             Constraint::Percentage(30),
-            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+            Constraint::Length(6),
+            Constraint::Min(3),
         ])
         .split(right_area);
 
     let connected_area = right_chunks[0];
     let discovered_area = right_chunks[1];
     let status_area = right_chunks[2];
+    let events_area = right_chunks[3];
 
-    render_events(f, events_area, state);
+    render_chat(f, chat_area, state);
     render_input(f, input_area, state);
     render_connected(f, connected_area, state);
     render_discovered(f, discovered_area, state);
     render_status(f, status_area, state);
+    render_eventlog(f, events_area, state);
     render_help(f, help_area);
 }
 
-fn render_events(f: &mut Frame, area: Rect, state: &TuiState) {
-    let block = Block::default().borders(Borders::ALL).title(" Chat / Events Log ");
+/// Render the main chat pane (chat messages only).
+fn render_chat(f: &mut Frame, area: Rect, state: &TuiState) {
+    render_log(f, area, " Chat ", &state.chat);
+}
+
+/// Render the system/event log pane (non-chat events).
+fn render_eventlog(f: &mut Frame, area: Rect, state: &TuiState) {
+    render_log(f, area, " Events ", &state.events);
+}
+
+/// Shared scrolling-log renderer: draws the last `visible_h` lines of `lines`.
+fn render_log(f: &mut Frame, area: Rect, title: &str, lines: &[Line<'static>]) {
+    let block = Block::default().borders(Borders::ALL).title(title.to_string());
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let visible_h = inner.height as usize;
-    let total = state.events.len();
-    let start = total.saturating_sub(visible_h);
+    let start = lines.len().saturating_sub(visible_h);
 
-    let lines: Vec<Line> = state.events[start..].to_vec();
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let visible: Vec<Line> = lines[start..].to_vec();
+    let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
     f.render_widget(paragraph, inner);
 }
 
