@@ -1,2 +1,4 @@
 /target
 /.hatch-chat
+hatch-chat.log
+.pi-subagents/
