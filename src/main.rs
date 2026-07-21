@@ -3,13 +3,20 @@
 //! Builds on Phase 2 (NAT traversal) with persistent peer cache,
 //! bootstrap node support, parallel discovery orchestration, Kademlia
 //! DHT provider records, and peer exchange (PEX).
+//!
+//! The app now features a **TUI** (terminal user interface) that starts
+//! immediately on launch and shows the P2P connection/discovery process
+//! in real-time.  The swarm runs in the main tokio task while the TUI
+//! runs in a separate OS thread; they communicate via channels.
 
 mod discovery;
 mod network;
 mod peer_cache;
+mod tui;
 
 use clap::Parser;
 use futures::StreamExt;
+use libp2p::gossipsub::IdentTopic;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use network::{
@@ -20,8 +27,10 @@ use peer_cache::{current_timestamp, PeerCache, PeerRecord};
 use discovery::{BootstrapConfig, BootstrapStrategy, DiscoveryOrchestrator, PeerCacheStrategy};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tui::{UiEvent, UserAction};
 
 /// CLI arguments.
 #[derive(Parser, Debug)]
@@ -53,11 +62,18 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Redirect tracing to a file so the TUI owns the terminal.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("hatch-chat.log")?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(Mutex::new(log_file))
         .init();
 
     let args = Args::parse();
@@ -95,6 +111,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cached_count = peer_cache.all_peers().map(|p| p.len()).unwrap_or(0);
     tracing::info!("Peer cache has {cached_count} cached peers");
 
+    // ── Create channels: swarm ↔ TUI ────────────────────────────────────
+    //
+    //   ui_tx  (std::sync::mpsc::Sender<UiEvent>)   — swarm → TUI
+    //   action_tx (tokio::sync::mpsc::Sender<UserAction>) — TUI → swarm
+    //
+    // The TUI runs in a separate OS thread with blocking crossterm polling.
+    let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::channel::<UserAction>(64);
+
+    // ── Start TUI thread immediately ────────────────────────────────────
+    let our_peer_id_str = peer_id.to_string();
+    let tui_thread = std::thread::Builder::new()
+        .name("hatch-chat-tui".into())
+        .spawn(move || {
+            if let Err(e) = tui::run_tui(ui_rx, action_tx, our_peer_id_str, cached_count) {
+                eprintln!("TUI error: {e}");
+            }
+        })?;
+
+    // Send initial info to the TUI.
+    let _ = ui_tx.send(UiEvent::Info(format!("Local PeerId: {peer_id}")));
+    let _ = ui_tx.send(UiEvent::Info(format!(
+        "Subscribed to gossipsub topic: {}",
+        network::GOSSIPSUB_TOPIC
+    )));
+    let _ = ui_tx.send(UiEvent::Info(format!(
+        "Peer cache initialized with {cached_count} peers"
+    )));
+
     // ── Phase 3: Bootstrap & Discovery ──────────────────────────────────
     if !args.bootstrap_seed {
         let bootstrap_config = BootstrapConfig {
@@ -108,6 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         orchestrator.add_strategy(Box::new(BootstrapStrategy::new(bootstrap_config)));
 
         let discovered = orchestrator.discover().await;
+        let _ = ui_tx.send(UiEvent::Info(format!(
+            "Discovery orchestrator found {} peers",
+            discovered.len()
+        )));
         tracing::info!("Discovery orchestrator found {} peers", discovered.len());
 
         for record in &discovered {
@@ -117,8 +166,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         tracing::debug!("--no-local: skipping local address {ma}");
                         continue;
                     }
+                    let _ = ui_tx.send(UiEvent::PeerDiscovered {
+                        peer_id: record.peer_id.clone(),
+                        addr: addr_str.clone(),
+                        source: "cache".to_string(),
+                    });
                     tracing::info!("Dialing discovered peer {} at {}", record.peer_id, ma);
                     if let Err(e) = swarm.dial(ma.clone()) {
+                        let _ = ui_tx.send(UiEvent::Warn(format!("Failed to dial {ma}: {e}")));
                         tracing::warn!("Failed to dial {ma}: {e}");
                     }
                     if let Some(pid) = extract_peer_id(&ma) {
@@ -128,6 +183,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     } else {
+        let _ = ui_tx.send(UiEvent::Info(
+            "Running as bootstrap seed node — skipping outbound discovery".to_string(),
+        ));
         tracing::info!("Running as bootstrap seed node — skipping outbound discovery");
     }
 
@@ -139,6 +197,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .behaviour_mut()
                     .kademlia
                     .add_address(&bs_peer_id, addr);
+                let _ = ui_tx.send(UiEvent::Info(format!(
+                    "Added bootstrap peer {bs_peer_id} to Kademlia DHT"
+                )));
                 tracing::info!("Added bootstrap peer {bs_peer_id} to Kademlia DHT");
             }
         }
@@ -154,24 +215,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut dht_republish = tokio::time::interval(Duration::from_secs(1800)); // 30 minutes
     dht_republish.tick().await; // consume immediate tick
 
-    // Ctrl+C → graceful shutdown.
+    // Ctrl+C → graceful shutdown (safety net; TUI normally handles quit).
     let (ctrl_c_tx, mut ctrl_c_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("ctrl_c handler");
-        drop(ctrl_c_tx.send(()));
+        tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+        let _ = ctrl_c_tx.send(()).await;
     });
 
     // Track relayed connections per peer so we can close them when a
     // direct connection is established (connection priority).
     let mut relayed_conns: HashMap<PeerId, Vec<libp2p::swarm::ConnectionId>> = HashMap::new();
 
+    let _ = ui_tx.send(UiEvent::Info("Starting swarm event loop…".to_string()));
     tracing::info!("Starting swarm event loop…  Press Ctrl+C to quit.");
 
     loop {
         tokio::select! {
+            // User actions from the TUI.
+            action = action_rx.recv() => {
+                match action {
+                    Some(UserAction::Quit) => {
+                        let _ = ui_tx.send(UiEvent::Info("Shutting down…".to_string()));
+                        tracing::info!("Quit received from TUI — shutting down.");
+                        break;
+                    }
+                    Some(UserAction::SendMessage { peer_id: target, text }) => {
+                        let msg = network::ChatMessage {
+                            from: peer_id.to_string(),
+                            text: text.clone(),
+                            timestamp: current_timestamp(),
+                        };
+                        let _ = swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_request(&target, msg);
+                        // Echo to our own event log.
+                        let _ = ui_tx.send(UiEvent::ChatMessage {
+                            from: "me".to_string(),
+                            text,
+                        });
+                    }
+                    Some(UserAction::Broadcast { text }) => {
+                        let msg = network::ChatMessage {
+                            from: peer_id.to_string(),
+                            text: text.clone(),
+                            timestamp: current_timestamp(),
+                        };
+                        let topic = IdentTopic::new(network::GOSSIPSUB_TOPIC);
+                        match swarm.behaviour_mut().gossipsub.publish(topic, serde_json::to_vec(&msg).unwrap_or_default()) {
+                            Ok(_) => {
+                                let _ = ui_tx.send(UiEvent::ChatMessage {
+                                    from: "me".to_string(),
+                                    text,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = ui_tx.send(UiEvent::Warn(format!("Broadcast failed: {e}")));
+                            }
+                        }
+                    }
+                    None => {
+                        // TUI thread disconnected — shut down.
+                        tracing::info!("TUI disconnected — shutting down.");
+                        break;
+                    }
+                }
+            }
             _ = ctrl_c_rx.recv() => {
+                let _ = ui_tx.send(UiEvent::Info("Ctrl+C received — shutting down.".to_string()));
                 tracing::info!("Ctrl+C received — shutting down.");
                 break;
             }
@@ -181,8 +292,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             _ = prune_interval.tick() => {
                 // Prune peers not seen in 7 days.
                 if let Err(e) = peer_cache.prune_stale(7 * 24 * 3600) {
+                    let _ = ui_tx.send(UiEvent::Warn(format!("Failed to prune stale peers: {e}")));
                     tracing::warn!("Failed to prune stale peers: {e}");
                 } else {
+                    let _ = ui_tx.send(UiEvent::Info("Pruned stale peers (older than 7 days)".to_string()));
                     tracing::info!("Pruned stale peers (older than 7 days)");
                 }
             }
@@ -208,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
                 // Also query the DHT for other peers advertising the service.
                 network::discover_via_dht(&mut swarm.behaviour_mut().kademlia);
+                let _ = ui_tx.send(UiEvent::Info("Republished DHT provider records and started discovery query".to_string()));
                 tracing::info!("Republished DHT provider records and started discovery query");
             }
             event = swarm.select_next_some() => {
@@ -218,10 +332,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &mut relayed_conns,
                     &peer_cache,
                     peer_id,
+                    &ui_tx,
                 );
             }
         }
     }
+
+    // Clean up: drop the UI sender so the TUI thread knows we're done,
+    // then join it to ensure the terminal is restored.
+    drop(ui_tx);
+    let _ = tui_thread.join();
 
     Ok(())
 }
@@ -290,9 +410,11 @@ fn handle_swarm_event(
     relayed_conns: &mut HashMap<PeerId, Vec<libp2p::swarm::ConnectionId>>,
     peer_cache: &PeerCache,
     our_peer_id: PeerId,
+    ui_tx: &mpsc::Sender<UiEvent>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
+            let _ = ui_tx.send(UiEvent::ListenAddr(address.to_string()));
             tracing::info!("Listening on: {address}");
         }
 
@@ -319,7 +441,14 @@ fn handle_swarm_event(
                 .send_request(&peer_id, pex_msg);
             tracing::debug!("Sent PEX message to {peer_id}");
 
-            if is_direct_address(remote_addr) {
+            let direct = is_direct_address(remote_addr);
+            let _ = ui_tx.send(UiEvent::PeerConnected {
+                peer_id: peer_id.to_string(),
+                addr: remote_addr.to_string(),
+                direct,
+            });
+
+            if direct {
                 tracing::info!(
                     "Direct connection to peer {peer_id} (conn {connection_id}) at {remote_addr}"
                 );
@@ -348,6 +477,9 @@ fn handle_swarm_event(
             cause,
             ..
         } => {
+            let _ = ui_tx.send(UiEvent::PeerDisconnected {
+                peer_id: peer_id.to_string(),
+            });
             tracing::info!("Connection closed with {peer_id} (conn {connection_id}): {cause:?}");
             // Remove the closed connection from our relayed tracking.
             if let Some(conns) = relayed_conns.get_mut(&peer_id) {
@@ -361,6 +493,9 @@ fn handle_swarm_event(
         SwarmEvent::OutgoingConnectionError {
             peer_id, error, ..
         } => {
+            let _ = ui_tx.send(UiEvent::Warn(format!(
+                "Outgoing connection error (peer {peer_id:?}): {error}"
+            )));
             tracing::warn!("Outgoing connection error (peer {peer_id:?}): {error}");
         }
 
@@ -369,6 +504,9 @@ fn handle_swarm_event(
             connection_id,
             ..
         } => {
+            let _ = ui_tx.send(UiEvent::Warn(format!(
+                "Incoming connection error (conn {connection_id}): {error}"
+            )));
             tracing::warn!("Incoming connection error (conn {connection_id}): {error}");
         }
 
@@ -381,6 +519,11 @@ fn handle_swarm_event(
                 return;
             }
             for (peer_id, addr) in peers {
+                let _ = ui_tx.send(UiEvent::PeerDiscovered {
+                    peer_id: peer_id.to_string(),
+                    addr: addr.to_string(),
+                    source: "mDNS".to_string(),
+                });
                 tracing::info!("mDNS discovered: {peer_id} at {addr}");
                 swarm
                     .behaviour_mut()
@@ -407,6 +550,13 @@ fn handle_swarm_event(
                     is_new_peer,
                     ..
                 } => {
+                    if is_new_peer {
+                        let _ = ui_tx.send(UiEvent::PeerDiscovered {
+                            peer_id: peer.to_string(),
+                            addr: addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
+                            source: "DHT".to_string(),
+                        });
+                    }
                     tracing::debug!(
                         "Kademlia routing updated: {peer} (new={is_new_peer}) — {addresses:?}"
                     );
@@ -418,6 +568,10 @@ fn handle_swarm_event(
                         libp2p::kad::QueryResult::GetRecord(Ok(ok)) => {
                             match ok {
                                 libp2p::kad::GetRecordOk::FoundRecord(peer_record) => {
+                                    let _ = ui_tx.send(UiEvent::DhtRecord(format!(
+                                        "GetRecord query {id}: found record with {} bytes",
+                                        peer_record.record.value.len()
+                                    )));
                                     tracing::info!(
                                         "Kademlia GetRecord query {id}: found record with {} bytes",
                                         peer_record.record.value.len()
@@ -430,11 +584,19 @@ fn handle_swarm_event(
                                             && !rec.multiaddrs.is_empty()
                                         {
                                             if let Err(e) = peer_cache.save_peer(&rec) {
+                                                let _ = ui_tx.send(UiEvent::Warn(format!(
+                                                    "Failed to save DHT-discovered peer {}: {e}",
+                                                    rec.peer_id
+                                                )));
                                                 tracing::warn!(
                                                     "Failed to save DHT-discovered peer {}: {e}",
                                                     rec.peer_id
                                                 );
                                             } else {
+                                                let _ = ui_tx.send(UiEvent::Info(format!(
+                                                    "Saved DHT-discovered peer {} to cache",
+                                                    rec.peer_id
+                                                )));
                                                 tracing::info!(
                                                     "Saved DHT-discovered peer {} to cache",
                                                     rec.peer_id
@@ -465,6 +627,10 @@ fn handle_swarm_event(
                 peer_id, info, ..
             },
         )) => {
+            let _ = ui_tx.send(UiEvent::Info(format!(
+                "Identify received from {peer_id}: agent={}",
+                info.agent_version
+            )));
             tracing::info!(
                 "Identify received from {peer_id}: agent={} listen_addrs={:?}",
                 info.agent_version,
@@ -491,12 +657,25 @@ fn handle_swarm_event(
                     message_id,
                     message,
                 } => {
+                    // Try to parse as a ChatMessage for display.
+                    if let Ok(chat_msg) = serde_json::from_slice::<network::ChatMessage>(&message.data) {
+                        let _ = ui_tx.send(UiEvent::ChatMessage {
+                            from: chat_msg.from,
+                            text: chat_msg.text,
+                        });
+                    } else {
+                        let _ = ui_tx.send(UiEvent::Info(format!(
+                            "GossipSub message from {peer_id} (id {message_id}): {} bytes",
+                            message.data.len()
+                        )));
+                    }
                     tracing::info!(
                         "GossipSub message from {peer_id} (id {message_id}): {} bytes",
                         message.data.len()
                     );
                 }
                 libp2p::gossipsub::Event::Subscribed { peer_id, topic } => {
+                    let _ = ui_tx.send(UiEvent::Info(format!("Peer {peer_id} subscribed to {topic}")));
                     tracing::info!("Peer {peer_id} subscribed to {topic}");
                 }
                 libp2p::gossipsub::Event::Unsubscribed { peer_id, topic } => {
@@ -522,6 +701,10 @@ fn handle_swarm_event(
                             request,
                             channel,
                         } => {
+                            let _ = ui_tx.send(UiEvent::ChatMessage {
+                                from: request.from.clone(),
+                                text: request.text.clone(),
+                            });
                             tracing::info!(
                                 "Direct message from {peer} (req {request_id}): from={}, text={}",
                                 request.from,
@@ -537,6 +720,10 @@ fn handle_swarm_event(
                             request_id,
                             response,
                         } => {
+                            let _ = ui_tx.send(UiEvent::Info(format!(
+                                "Response for req {request_id} from {peer}: received={}",
+                                response.received
+                            )));
                             tracing::info!(
                                 "Response for req {request_id} from {peer}: received={}",
                                 response.received
@@ -549,6 +736,9 @@ fn handle_swarm_event(
                     request_id,
                     error,
                 } => {
+                    let _ = ui_tx.send(UiEvent::Warn(format!(
+                        "Request-response outbound failure to {peer} (req {request_id}): {error}"
+                    )));
                     tracing::warn!(
                         "Request-response outbound failure to {peer} (req {request_id}): {error}"
                     );
@@ -558,6 +748,9 @@ fn handle_swarm_event(
                     request_id,
                     error,
                 } => {
+                    let _ = ui_tx.send(UiEvent::Warn(format!(
+                        "Request-response inbound failure from {peer} (req {request_id:?}): {error}"
+                    )));
                     tracing::warn!(
                         "Request-response inbound failure from {peer} (req {request_id:?}): {error}"
                     );
@@ -585,10 +778,24 @@ fn handle_swarm_event(
                             channel,
                             ..
                         } => {
+                            let _ = ui_tx.send(UiEvent::Info(format!(
+                                "PEX message from {peer}: {} peers",
+                                request.peers.len()
+                            )));
                             tracing::info!(
                                 "PEX message from {peer}: {} peers",
                                 request.peers.len()
                             );
+                            // Report discovered peers from PEX.
+                            for record in &request.peers {
+                                if !record.peer_id.is_empty() && !record.multiaddrs.is_empty() {
+                                    let _ = ui_tx.send(UiEvent::PeerDiscovered {
+                                        peer_id: record.peer_id.clone(),
+                                        addr: record.multiaddrs.first().cloned().unwrap_or_default(),
+                                        source: "PEX".to_string(),
+                                    });
+                                }
+                            }
                             // Validate and save received peers to cache.
                             for record in &request.peers {
                                 if !record.peer_id.is_empty()
@@ -626,6 +833,9 @@ fn handle_swarm_event(
                     request_id,
                     error,
                 } => {
+                    let _ = ui_tx.send(UiEvent::Warn(format!(
+                        "PEX outbound failure to {peer} (req {request_id}): {error}"
+                    )));
                     tracing::warn!(
                         "PEX outbound failure to {peer} (req {request_id}): {error}"
                     );
@@ -635,6 +845,9 @@ fn handle_swarm_event(
                     request_id,
                     error,
                 } => {
+                    let _ = ui_tx.send(UiEvent::Warn(format!(
+                        "PEX inbound failure from {peer} (req {request_id:?}): {error}"
+                    )));
                     tracing::warn!(
                         "PEX inbound failure from {peer} (req {request_id:?}): {error}"
                     );
@@ -652,9 +865,20 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(network::AppBehaviourEvent::Autonat(event)) => {
             match event {
                 libp2p::autonat::Event::StatusChanged { old, new } => {
+                    let status_str = match &new {
+                        libp2p::autonat::NatStatus::Public(addr) => {
+                            format!("Public ({addr})")
+                        }
+                        libp2p::autonat::NatStatus::Private => "Private".to_string(),
+                        libp2p::autonat::NatStatus::Unknown => "Unknown".to_string(),
+                    };
+                    let _ = ui_tx.send(UiEvent::NatStatus(status_str.clone()));
                     tracing::info!("AutoNAT status changed: {old:?} -> {new:?}");
                     match &new {
                         libp2p::autonat::NatStatus::Public(addr) => {
+                            let _ = ui_tx.send(UiEvent::Info(format!(
+                                "AutoNAT: publicly reachable at {addr}"
+                            )));
                             tracing::info!(
                                 "AutoNAT: publicly reachable at {addr} \
                                  — relay server would be enabled (requires \
@@ -662,11 +886,15 @@ fn handle_swarm_event(
                             );
                         }
                         libp2p::autonat::NatStatus::Private => {
+                            let _ = ui_tx.send(UiEvent::Info(
+                                "AutoNAT: behind NAT — need relay + hole punching".to_string(),
+                            ));
                             tracing::info!(
                                 "AutoNAT: behind NAT — need relay + hole punching"
                             );
                         }
                         libp2p::autonat::NatStatus::Unknown => {
+                            let _ = ui_tx.send(UiEvent::Info("AutoNAT: NAT status unknown".to_string()));
                             tracing::info!("AutoNAT: NAT status unknown");
                         }
                     }
@@ -684,17 +912,24 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(network::AppBehaviourEvent::Dcutr(event)) => {
             match event.result {
                 Ok(connection_id) => {
+                    let _ = ui_tx.send(UiEvent::HolePunch {
+                        peer_id: event.remote_peer_id.to_string(),
+                        success: true,
+                    });
                     tracing::info!(
                         "DCUtR: hole punch succeeded with {} (conn {connection_id})",
                         event.remote_peer_id
                     );
                 }
                 Err(error) => {
+                    let _ = ui_tx.send(UiEvent::HolePunch {
+                        peer_id: event.remote_peer_id.to_string(),
+                        success: false,
+                    });
                     tracing::warn!(
                         "DCUtR: hole punch failed with {}: {error}",
                         event.remote_peer_id
                     );
-                    // Connection stays on relay — still works, just higher latency.
                 }
             }
         }
@@ -707,6 +942,9 @@ fn handle_swarm_event(
                     renewal,
                     limit,
                 } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Reservation accepted with relay {relay_peer_id} (renewal={renewal}, limit={limit:?})"
+                    )));
                     tracing::info!(
                         "Relay client: reservation accepted with relay {relay_peer_id} \
                          (renewal={renewal}, limit={limit:?})"
@@ -716,6 +954,9 @@ fn handle_swarm_event(
                     relay_peer_id,
                     limit,
                 } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Outbound circuit established via {relay_peer_id} (limit={limit:?})"
+                    )));
                     tracing::info!(
                         "Relay client: outbound circuit established via {relay_peer_id} \
                          (limit={limit:?})"
@@ -725,6 +966,9 @@ fn handle_swarm_event(
                     src_peer_id,
                     limit,
                 } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Inbound circuit established from {src_peer_id} (limit={limit:?})"
+                    )));
                     tracing::info!(
                         "Relay client: inbound circuit established from {src_peer_id} \
                          (limit={limit:?})"
@@ -740,20 +984,32 @@ fn handle_swarm_event(
                     src_peer_id,
                     renewed,
                 } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Reservation accepted from {src_peer_id} (renewed={renewed})"
+                    )));
                     tracing::info!(
                         "Relay server: reservation accepted from {src_peer_id} (renewed={renewed})"
                     );
                 }
                 libp2p::relay::Event::ReservationReqDenied { src_peer_id } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Reservation denied for {src_peer_id}"
+                    )));
                     tracing::info!("Relay server: reservation denied for {src_peer_id}");
                 }
                 libp2p::relay::Event::ReservationTimedOut { src_peer_id } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Reservation timed out for {src_peer_id}"
+                    )));
                     tracing::info!("Relay server: reservation timed out for {src_peer_id}");
                 }
                 libp2p::relay::Event::CircuitReqAccepted {
                     src_peer_id,
                     dst_peer_id,
                 } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Circuit request accepted: {src_peer_id} -> {dst_peer_id}"
+                    )));
                     tracing::info!(
                         "Relay server: circuit request accepted: {src_peer_id} -> {dst_peer_id}"
                     );
@@ -762,6 +1018,9 @@ fn handle_swarm_event(
                     src_peer_id,
                     dst_peer_id,
                 } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Circuit request denied: {src_peer_id} -> {dst_peer_id}"
+                    )));
                     tracing::info!(
                         "Relay server: circuit request denied: {src_peer_id} -> {dst_peer_id}"
                     );
@@ -771,6 +1030,9 @@ fn handle_swarm_event(
                     dst_peer_id,
                     error,
                 } => {
+                    let _ = ui_tx.send(UiEvent::RelayEvent(format!(
+                        "Circuit closed: {src_peer_id} -> {dst_peer_id} (error={error:?})"
+                    )));
                     tracing::info!(
                         "Relay server: circuit closed: {src_peer_id} -> {dst_peer_id} (error={error:?})"
                     );
@@ -787,6 +1049,7 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::ExternalAddrConfirmed { address } => {
+            let _ = ui_tx.send(UiEvent::ListenAddr(format!("External address confirmed: {address}")));
             tracing::info!("External address confirmed: {address}");
         }
 
