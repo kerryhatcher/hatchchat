@@ -55,16 +55,43 @@ impl PeerCache {
     ///
     /// The directory is created if it does not exist.  The database file
     /// is placed at `<dir>/peer_cache.redb`.
+    ///
+    /// If the database is already open (e.g. another instance is running
+    /// in the same data directory), falls back to a unique temp directory
+    /// so that multiple instances can run simultaneously on the same
+    /// machine for testing.
     pub fn open(dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(dir).ok();
         let db_path = dir.join("peer_cache.redb");
-        let db = Database::create(&db_path)?;
 
-        // Ensure the table exists.
+        match Database::create(&db_path) {
+            Ok(db) => Self::init_tables(db),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                // Another process has the database locked.  Fall back to a
+                // unique temp directory so this instance can still run.
+                let fallback_dir = std::env::temp_dir().join(format!(
+                    "hatch-chat-peer-cache-{}",
+                    std::process::id()
+                ));
+                tracing::warn!(
+                    "Peer cache at {} is already open — falling back to temp dir {}",
+                    db_path.display(),
+                    fallback_dir.display(),
+                );
+                std::fs::create_dir_all(&fallback_dir).ok();
+                let fallback_path = fallback_dir.join("peer_cache.redb");
+                let db = Database::create(&fallback_path)?;
+                Self::init_tables(db)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Create the peer table if it doesn't already exist.
+    fn init_tables(db: Database) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let txn = db.begin_write()?;
         let _ = txn.open_table(PEER_TABLE)?;
         txn.commit()?;
-
         Ok(Self { db })
     }
 
