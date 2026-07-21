@@ -65,6 +65,10 @@ pub enum UiEvent {
     RelayEvent(String),
     /// DHT discovery result.
     DhtRecord(String),
+    /// Number of peers currently in the persistent cache.
+    CacheCount(usize),
+    /// The local node's PeerId, generated after the UI thread was spawned.
+    LocalPeerId(String),
 }
 
 /// Actions sent from the TUI thread → swarm task.
@@ -322,6 +326,12 @@ fn handle_ui_event(state: &mut TuiState, event: UiEvent) {
         }
         UiEvent::RelayEvent(msg) => add_event(state, &format!("Relay: {msg}"), EventKind::Info),
         UiEvent::DhtRecord(msg) => add_event(state, &format!("DHT: {msg}"), EventKind::Info),
+        UiEvent::CacheCount(n) => {
+            state.cache_count = n;
+        }
+        UiEvent::LocalPeerId(id) => {
+            state.our_peer_id = id;
+        }
     }
 }
 
@@ -568,9 +578,9 @@ fn render_help(f: &mut Frame, area: Rect) {
 /// Truncate a PeerId string to a readable length.
 fn short_pid(id: &str) -> String {
     const MAX: usize = 20;
-    if id.len() <= MAX {
+    if id.chars().count() <= MAX {
         id.to_string()
     } else {
-        format!("{}...", &id[..MAX - 3])
+        format!("{}...", id.chars().take(MAX - 3).collect::<String>())
     }
 }
