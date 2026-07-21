@@ -189,10 +189,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("Running as bootstrap seed node — skipping outbound discovery");
     }
 
-    // Add bootstrap nodes to Kademlia DHT.
+    // Add bootstrap nodes to Kademlia DHT and dial them directly.
+    // Bootstrap addresses bypass the --no-local filter because the user
+    // explicitly provided them — they are trusted seeds.
     for bs in &args.bootstrap {
         if let Ok(addr) = bs.parse::<Multiaddr>() {
             if let Some(bs_peer_id) = extract_peer_id(&addr) {
+                // Dial directly — don't let --no-local filter block explicitly
+                // provided bootstrap addresses.
+                if let Err(e) = swarm.dial(addr.clone()) {
+                    let _ = ui_tx.send(UiEvent::Warn(format!("Failed to dial bootstrap {addr}: {e}")));
+                    tracing::warn!("Failed to dial bootstrap {addr}: {e}");
+                } else {
+                    let _ = ui_tx.send(UiEvent::Info(format!(
+                        "Dialing bootstrap node {bs_peer_id} at {addr}"
+                    )));
+                    tracing::info!("Dialing bootstrap node {bs_peer_id} at {addr}");
+                }
                 swarm
                     .behaviour_mut()
                     .kademlia
