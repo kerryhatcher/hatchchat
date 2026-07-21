@@ -175,7 +175,12 @@ async fn run_node(
         transport,
         behaviour,
         peer_id,
-        libp2p::swarm::Config::with_tokio_executor(),
+        // libp2p 0.53+ defaults idle_connection_timeout to ZERO, which closes
+        // any connection the moment it has no active stream — peers connect,
+        // finish identify, then immediately drop with KeepAliveTimeout. Hold
+        // idle connections open so discovered peers stay connected for chat.
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(std::time::Duration::from_secs(60)),
     );
 
     tracing::info!("Subscribed to gossipsub topic: {}", network::GOSSIPSUB_TOPIC);
