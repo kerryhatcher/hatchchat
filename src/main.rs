@@ -60,9 +60,8 @@ struct Args {
     data_dir: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Redirect tracing to a file so the TUI owns the terminal.
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Redirect tracing to a file so the UI owns the terminal / stdout.
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -77,6 +76,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let args = Args::parse();
+
+    // Channels: UI ends held here, swarm ends handed to run_node.
+    let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
+    let (action_tx, action_rx) = tokio::sync::mpsc::channel::<UserAction>(64);
+
+    // TUI path (default): swarm on main thread, TUI in a spawned thread.
+    let tui_thread = std::thread::Builder::new()
+        .name("hatch-chat-tui".into())
+        .spawn(move || {
+            // our_peer_id + cache_count are sent to the TUI as UiEvents by
+            // run_node; the TUI starts with placeholders and updates live.
+            if let Err(e) = tui::run_tui(ui_rx, action_tx, String::new(), 0) {
+                eprintln!("TUI error: {e}");
+            }
+        })?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_node(args, ui_tx, action_rx));
+
+    let _ = tui_thread.join();
+    result
+}
+
+async fn run_node(
+    args: Args,
+    ui_tx: mpsc::Sender<UiEvent>,
+    mut action_rx: tokio::sync::mpsc::Receiver<UserAction>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let no_local = args.no_local;
 
     // Generate an Ed25519 keypair → derive PeerId.
@@ -110,25 +139,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cached_count = peer_cache.all_peers().map(|p| p.len()).unwrap_or(0);
     tracing::info!("Peer cache has {cached_count} cached peers");
-
-    // ── Create channels: swarm ↔ TUI ────────────────────────────────────
-    //
-    //   ui_tx  (std::sync::mpsc::Sender<UiEvent>)   — swarm → TUI
-    //   action_tx (tokio::sync::mpsc::Sender<UserAction>) — TUI → swarm
-    //
-    // The TUI runs in a separate OS thread with blocking crossterm polling.
-    let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
-    let (action_tx, mut action_rx) = tokio::sync::mpsc::channel::<UserAction>(64);
-
-    // ── Start TUI thread immediately ────────────────────────────────────
-    let our_peer_id_str = peer_id.to_string();
-    let tui_thread = std::thread::Builder::new()
-        .name("hatch-chat-tui".into())
-        .spawn(move || {
-            if let Err(e) = tui::run_tui(ui_rx, action_tx, our_peer_id_str, cached_count) {
-                eprintln!("TUI error: {e}");
-            }
-        })?;
 
     // Send initial info to the TUI.
     let _ = ui_tx.send(UiEvent::Info(format!("Local PeerId: {peer_id}")));
@@ -350,11 +360,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     }
-
-    // Clean up: drop the UI sender so the TUI thread knows we're done,
-    // then join it to ensure the terminal is restored.
-    drop(ui_tx);
-    let _ = tui_thread.join();
 
     Ok(())
 }
