@@ -62,11 +62,21 @@ fn apply_ui_event(state: &mut GuiState, event: UiEvent) {
         UiEvent::Info(m) => state.push(m, EventKind::Info),
         UiEvent::Warn(m) => state.push(m, EventKind::Warn),
         UiEvent::CacheCount(n) => state.cache_count = n,
-        UiEvent::NatStatus(s) => state.nat_status = s.clone(),
-        UiEvent::ListenAddr(_a) => {},
-        UiEvent::RelayEvent(_m) => {},
-        UiEvent::DhtRecord(_m) => {},
-        UiEvent::HolePunch { .. } => {},
+        UiEvent::NatStatus(s) => {
+            state.nat_status = s.clone();
+            state.push(format!("NAT status: {s}"), EventKind::System);
+        }
+        UiEvent::ListenAddr(a) => state.push(format!("Listening on {a}"), EventKind::System),
+        UiEvent::RelayEvent(m) => state.push(format!("Relay: {m}"), EventKind::Info),
+        UiEvent::DhtRecord(m) => state.push(format!("DHT: {m}"), EventKind::Info),
+        UiEvent::HolePunch { peer_id, success } => {
+            let (msg, kind) = if success {
+                (format!("Hole punch succeeded with {}", short_pid(&peer_id)), EventKind::System)
+            } else {
+                (format!("Hole punch failed with {}", short_pid(&peer_id)), EventKind::Warn)
+            };
+            state.push(msg, kind);
+        }
         UiEvent::ChatMessage { from, text } => {
             state.push(format!("[{}] {}", short_pid(&from), text), EventKind::Chat);
         }
@@ -74,18 +84,22 @@ fn apply_ui_event(state: &mut GuiState, event: UiEvent) {
             if !state.connected_peers.iter().any(|p| p.peer_id == peer_id) {
                 state.connected_peers.push(ConnPeer { peer_id: peer_id.clone(), addr: addr.clone(), direct });
             }
+            let kind_str = if direct { "direct" } else { "relayed" };
+            state.push(format!("Connected to {} ({kind_str}) at {}", short_pid(&peer_id), addr), EventKind::System);
         }
         UiEvent::PeerDisconnected { peer_id } => {
             state.connected_peers.retain(|p| p.peer_id != peer_id);
             if state.selected_peer >= state.connected_peers.len() {
                 state.selected_peer = state.connected_peers.len().saturating_sub(1);
             }
+            state.push(format!("Disconnected from {}", short_pid(&peer_id)), EventKind::System);
         }
         UiEvent::PeerDiscovered { peer_id, addr, source } => {
             if !state.discovered_peers.iter().any(|p| p.peer_id == peer_id && p.addr == addr) {
                 state.discovered_peers.push(DiscPeer { peer_id: peer_id.clone(), addr: addr.clone(), source: source.clone() });
                 if state.discovered_peers.len() > 100 { state.discovered_peers.remove(0); }
             }
+            state.push(format!("Discovered {} at {} via {}", short_pid(&peer_id), addr, source), EventKind::System);
         }
     }
 }
@@ -172,8 +186,7 @@ mod tests {
         assert_eq!(s.connected_peers.len(), 0);
 
         apply_ui_event(&mut s, UiEvent::ChatMessage { from: "bob".into(), text: "hi".into() });
-        assert_eq!(s.events.len(), 1);
-        assert!(s.events[0].text.contains("hi"));
+        assert!(s.events.last().unwrap().text.contains("hi"));
     }
 
     #[test]
