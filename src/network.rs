@@ -13,8 +13,9 @@ use libp2p::kad::store::MemoryStore;
 use libp2p::request_response;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, relay, PeerId, Transport};
+use crate::peer_cache::PeerRecord;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Message types ───────────────────────────────────────────────────────────
 
@@ -34,6 +35,24 @@ pub struct ChatResponse {
 
 /// GossipSub topic used for presence / discovery announcements.
 pub const GOSSIPSUB_TOPIC: &str = "hearty-p2p/discovery/v1";
+
+/// Service key advertised in the Kademlia DHT so that other hearty-p2p
+/// nodes can discover us.
+pub const DHT_SERVICE_KEY: &[u8] = b"hearty-p2p";
+
+/// Peer Exchange (PEX) message — exchanged on new connections so that
+/// peers learn about each other's known peer lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerExchangeMessage {
+    pub peers: Vec<PeerRecord>,
+    pub timestamp: u64,
+}
+
+/// Acknowledgement returned for a PEX message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PexResponse {
+    pub received: bool,
+}
 
 // ── Transport ───────────────────────────────────────────────────────────────
 
@@ -117,6 +136,8 @@ pub struct AppBehaviour {
     pub identify: identify::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub request_response: request_response::cbor::Behaviour<ChatMessage, ChatResponse>,
+    /// Peer Exchange (PEX) — exchanges known peer lists on connection.
+    pub pex: request_response::cbor::Behaviour<PeerExchangeMessage, PexResponse>,
     /// AutoNAT — detects whether the local node is behind NAT.
     pub autonat: autonat::Behaviour,
     /// Circuit Relay v2 client — acquires reservations with public relays.
@@ -192,6 +213,15 @@ pub fn build_behaviour(
         request_response::Config::default(),
     );
 
+    // PEX — Peer Exchange protocol (CBOR request-response).
+    let pex = request_response::cbor::Behaviour::new(
+        [(
+            libp2p::StreamProtocol::new("/hatch-chat/pex/1.0.0"),
+            request_response::ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
+
     // AutoNAT — probes connected peers to determine NAT status.
     let autonat = autonat::Behaviour::new(
         peer_id,
@@ -213,6 +243,7 @@ pub fn build_behaviour(
         identify,
         gossipsub,
         request_response,
+        pex,
         autonat,
         relay_client,
         relay_server,
@@ -324,4 +355,54 @@ pub fn log_nat_status(behaviour: &AppBehaviour) -> bool {
             false
         }
     }
+}
+
+// ── Kademlia DHT provider records (Phase 3) ───────────────────────────────
+
+/// Advertise ourselves in the Kademlia DHT by putting a record under the
+/// service key [`DHT_SERVICE_KEY`].  Other hearty-p2p nodes can discover
+/// us by querying for this key.
+///
+/// Also puts a record keyed by our own PeerId so that peers can look us
+/// up directly.
+pub fn advertise_in_dht(
+    kademlia: &mut kad::Behaviour<MemoryStore>,
+    our_peer_id: PeerId,
+    our_record: &PeerRecord,
+) {
+    // 1. Service-key record — allows service-based discovery.
+    let service_key = kad::RecordKey::new(&DHT_SERVICE_KEY.to_vec());
+    let service_record = kad::Record {
+        key: service_key,
+        value: our_peer_id.to_bytes(),
+        publisher: Some(our_peer_id),
+        expires: Some(Instant::now() + Duration::from_secs(3600)),
+    };
+    if let Err(e) = kademlia.put_record(service_record, kad::Quorum::All) {
+        tracing::warn!("Failed to put DHT service record: {e}");
+    }
+
+    // 2. Peer-keyed record — our full peer info as JSON.
+    let peer_key = kad::RecordKey::new(&our_peer_id.to_bytes());
+    if let Ok(value) = serde_json::to_vec(our_record) {
+        let peer_record = kad::Record {
+            key: peer_key,
+            value,
+            publisher: Some(our_peer_id),
+            expires: Some(Instant::now() + Duration::from_secs(3600)),
+        };
+        if let Err(e) = kademlia.put_record(peer_record, kad::Quorum::All) {
+            tracing::warn!("Failed to put DHT peer record: {e}");
+        }
+    }
+
+    tracing::debug!("Advertised in DHT with service key {:?}", DHT_SERVICE_KEY);
+}
+
+/// Start a Kademlia DHT query for peers providing the hearty-p2p service.
+/// Results arrive as `kad::Event::OutboundQueryProgressed` events.
+pub fn discover_via_dht(kademlia: &mut kad::Behaviour<MemoryStore>) {
+    let service_key = kad::RecordKey::new(&DHT_SERVICE_KEY.to_vec());
+    kademlia.get_record(service_key);
+    tracing::debug!("Started DHT discovery query for service key {:?}", DHT_SERVICE_KEY);
 }

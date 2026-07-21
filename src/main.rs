@@ -1,25 +1,31 @@
-//! hatch-chat — hearty-p2p Phase 1: direct P2P with libp2p.
+//! hatch-chat — hearty-p2p Phase 3: Resilient Discovery.
 //!
-//! Creates a libp2p swarm with TCP + QUIC transports, mDNS LAN discovery,
-//! Kademlia DHT, Identify, GossipSub, and a CBOR request-response chat
-//! protocol. Supports `--no-local` to force internet-only connections.
+//! Builds on Phase 2 (NAT traversal) with persistent peer cache,
+//! bootstrap node support, parallel discovery orchestration, Kademlia
+//! DHT provider records, and peer exchange (PEX).
 
+mod discovery;
 mod network;
+mod peer_cache;
 
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use network::{
-    build_behaviour, build_transport, close_relayed_connections, filter_addresses,
-    is_direct_address, is_internet_address, ChatResponse,
+    advertise_in_dht, build_behaviour, build_transport, close_relayed_connections,
+    filter_addresses, is_direct_address, is_internet_address, ChatResponse, PexResponse,
 };
+use peer_cache::{current_timestamp, PeerCache, PeerRecord};
+use discovery::{BootstrapConfig, BootstrapStrategy, DiscoveryOrchestrator, PeerCacheStrategy};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// CLI arguments.
 #[derive(Parser, Debug)]
-#[command(name = "hatch-chat", about = "Hearty P2P chat — Phase 1")]
+#[command(name = "hatch-chat", about = "Hearty P2P chat — Phase 3")]
 struct Args {
     /// Port to listen on (0 = random free port).
     #[arg(long, default_value = "0")]
@@ -31,13 +37,22 @@ struct Args {
     #[arg(long)]
     no_local: bool,
 
-    /// Bootstrap node multiaddr to connect to on startup.
+    /// Bootstrap node multiaddr(s) to connect to on startup.
+    /// Can be specified multiple times.
     #[arg(long)]
-    bootstrap: Option<String>,
+    bootstrap: Vec<String>,
+
+    /// Act as a bootstrap seed node (does not dial other bootstrap nodes).
+    #[arg(long)]
+    bootstrap_seed: bool,
+
+    /// Data directory for persistent state (peer cache).
+    #[arg(long, default_value = ".hatch-chat")]
+    data_dir: String,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -72,31 +87,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     swarm.listen_on(tcp_addr)?;
     swarm.listen_on(quic_addr)?;
 
-    // Bootstrap if provided.
-    if let Some(bs) = &args.bootstrap {
-        match bs.parse::<Multiaddr>() {
-            Ok(addr) => {
-                tracing::info!("Dialing bootstrap node at {addr}");
-                swarm.dial(addr.clone())?;
+    // ── Phase 3: Initialize PeerCache ───────────────────────────────────
+    let data_dir = PathBuf::from(&args.data_dir);
+    let peer_cache: Arc<PeerCache> = Arc::new(PeerCache::open(&data_dir)?);
+    tracing::info!("Peer cache initialized at {}", data_dir.display());
 
-                // Try to extract the PeerId from the multiaddr and add it to Kademlia.
-                if let Some(bs_peer_id) = extract_peer_id(&addr) {
-                    swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&bs_peer_id, addr);
-                    tracing::info!("Added bootstrap peer {bs_peer_id} to Kademlia DHT");
+    let cached_count = peer_cache.all_peers().map(|p| p.len()).unwrap_or(0);
+    tracing::info!("Peer cache has {cached_count} cached peers");
+
+    // ── Phase 3: Bootstrap & Discovery ──────────────────────────────────
+    if !args.bootstrap_seed {
+        let bootstrap_config = BootstrapConfig {
+            nodes: args.bootstrap.clone(),
+            ..Default::default()
+        };
+
+        // Run discovery orchestrator (cached peers + bootstrap nodes).
+        let mut orchestrator = DiscoveryOrchestrator::new();
+        orchestrator.add_strategy(Box::new(PeerCacheStrategy::new(peer_cache.clone())));
+        orchestrator.add_strategy(Box::new(BootstrapStrategy::new(bootstrap_config)));
+
+        let discovered = orchestrator.discover().await;
+        tracing::info!("Discovery orchestrator found {} peers", discovered.len());
+
+        for record in &discovered {
+            for addr_str in &record.multiaddrs {
+                if let Ok(ma) = addr_str.parse::<Multiaddr>() {
+                    if no_local && !is_internet_address(&ma) {
+                        tracing::debug!("--no-local: skipping local address {ma}");
+                        continue;
+                    }
+                    tracing::info!("Dialing discovered peer {} at {}", record.peer_id, ma);
+                    if let Err(e) = swarm.dial(ma.clone()) {
+                        tracing::warn!("Failed to dial {ma}: {e}");
+                    }
+                    if let Some(pid) = extract_peer_id(&ma) {
+                        swarm.behaviour_mut().kademlia.add_address(&pid, ma);
+                    }
                 }
             }
-            Err(e) => {
-                tracing::error!("Invalid bootstrap multiaddr '{bs}': {e}");
+        }
+    } else {
+        tracing::info!("Running as bootstrap seed node — skipping outbound discovery");
+    }
+
+    // Add bootstrap nodes to Kademlia DHT.
+    for bs in &args.bootstrap {
+        if let Ok(addr) = bs.parse::<Multiaddr>() {
+            if let Some(bs_peer_id) = extract_peer_id(&addr) {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&bs_peer_id, addr);
+                tracing::info!("Added bootstrap peer {bs_peer_id} to Kademlia DHT");
             }
         }
     }
 
-    // Periodic Kademlia bootstrap.
+    // ── Periodic intervals ──────────────────────────────────────────────
     let mut kad_bootstrap = tokio::time::interval(Duration::from_secs(10));
     kad_bootstrap.tick().await; // consume the immediate first tick
+
+    let mut prune_interval = tokio::time::interval(Duration::from_secs(3600)); // 1 hour
+    prune_interval.tick().await; // consume immediate tick
+
+    let mut dht_republish = tokio::time::interval(Duration::from_secs(1800)); // 30 minutes
+    dht_republish.tick().await; // consume immediate tick
 
     // Ctrl+C → graceful shutdown.
     let (ctrl_c_tx, mut ctrl_c_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -104,7 +160,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::signal::ctrl_c()
             .await
             .expect("ctrl_c handler");
-        // Send shutdown signal; ignore the returned future.
         drop(ctrl_c_tx.send(()));
     });
 
@@ -123,8 +178,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = kad_bootstrap.tick() => {
                 let _ = swarm.behaviour_mut().kademlia.bootstrap();
             }
+            _ = prune_interval.tick() => {
+                // Prune peers not seen in 7 days.
+                if let Err(e) = peer_cache.prune_stale(7 * 24 * 3600) {
+                    tracing::warn!("Failed to prune stale peers: {e}");
+                } else {
+                    tracing::info!("Pruned stale peers (older than 7 days)");
+                }
+            }
+            _ = dht_republish.tick() => {
+                // Republish our DHT provider records.
+                let addrs: Vec<String> = swarm.external_addresses()
+                    .map(|a| a.to_string())
+                    .collect();
+                let our_record = PeerRecord {
+                    peer_id: peer_id.to_string(),
+                    multiaddrs: addrs,
+                    i2p_destination: None,
+                    last_seen: current_timestamp(),
+                    connection_count: 0,
+                    rtt_ms: None,
+                    is_relay: false,
+                    is_public: false,
+                };
+                advertise_in_dht(
+                    &mut swarm.behaviour_mut().kademlia,
+                    peer_id,
+                    &our_record,
+                );
+                // Also query the DHT for other peers advertising the service.
+                network::discover_via_dht(&mut swarm.behaviour_mut().kademlia);
+                tracing::info!("Republished DHT provider records and started discovery query");
+            }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, no_local, &mut relayed_conns);
+                handle_swarm_event(
+                    event,
+                    &mut swarm,
+                    no_local,
+                    &mut relayed_conns,
+                    &peer_cache,
+                    peer_id,
+                );
             }
         }
     }
@@ -153,12 +247,49 @@ fn safe_dial(swarm: &mut Swarm<network::AppBehaviour>, addr: Multiaddr, no_local
     }
 }
 
+/// Save (or update) a peer record in the cache on connection.
+fn save_peer_to_cache(peer_cache: &PeerCache, peer_id: PeerId, remote_addr: &Multiaddr) {
+    let pid_str = peer_id.to_string();
+    let existing = peer_cache.get_peer(&pid_str).ok().flatten();
+    let record = PeerRecord {
+        peer_id: pid_str,
+        multiaddrs: {
+            // Merge with existing addresses, deduplicated.
+            let mut addrs = vec![remote_addr.to_string()];
+            if let Some(ref ex) = existing {
+                for a in &ex.multiaddrs {
+                    if !addrs.contains(a) {
+                        addrs.push(a.clone());
+                    }
+                }
+            }
+            addrs
+        },
+        i2p_destination: existing.as_ref().and_then(|r| r.i2p_destination.clone()),
+        last_seen: current_timestamp(),
+        connection_count: existing
+            .as_ref()
+            .map(|r| r.connection_count + 1)
+            .unwrap_or(1),
+        rtt_ms: existing.as_ref().and_then(|r| r.rtt_ms),
+        is_relay: existing.as_ref().map(|r| r.is_relay).unwrap_or(false),
+        is_public: existing.as_ref().map(|r| r.is_public).unwrap_or(false),
+    };
+    if let Err(e) = peer_cache.save_peer(&record) {
+        tracing::warn!("Failed to save peer {peer_id} to cache: {e}");
+    } else {
+        tracing::debug!("Saved peer {peer_id} to cache (conns={})", record.connection_count);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn handle_swarm_event(
     event: SwarmEvent<network::AppBehaviourEvent>,
     swarm: &mut Swarm<network::AppBehaviour>,
     no_local: bool,
     relayed_conns: &mut HashMap<PeerId, Vec<libp2p::swarm::ConnectionId>>,
+    peer_cache: &PeerCache,
+    our_peer_id: PeerId,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -172,6 +303,22 @@ fn handle_swarm_event(
             ..
         } => {
             let remote_addr = endpoint.get_remote_address();
+
+            // ── Phase 3: Save peer to cache ────────────────────────────
+            save_peer_to_cache(peer_cache, peer_id, remote_addr);
+
+            // ── Phase 3: Send PEX message ───────────────────────────────
+            let known_peers = peer_cache.all_peers().unwrap_or_default();
+            let pex_msg = network::PeerExchangeMessage {
+                peers: known_peers,
+                timestamp: current_timestamp(),
+            };
+            swarm
+                .behaviour_mut()
+                .pex
+                .send_request(&peer_id, pex_msg);
+            tracing::debug!("Sent PEX message to {peer_id}");
+
             if is_direct_address(remote_addr) {
                 tracing::info!(
                     "Direct connection to peer {peer_id} (conn {connection_id}) at {remote_addr}"
@@ -187,6 +334,12 @@ fn handle_swarm_event(
                     .or_default()
                     .push(connection_id);
             }
+
+            // Add peer to Kademlia routing table.
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer_id, remote_addr.clone());
         }
 
         SwarmEvent::ConnectionClosed {
@@ -261,7 +414,44 @@ fn handle_swarm_event(
                 libp2p::kad::Event::OutboundQueryProgressed {
                     id, result, ..
                 } => {
-                    tracing::debug!("Kademlia query {id} progressed: {result:?}");
+                    match &result {
+                        libp2p::kad::QueryResult::GetRecord(Ok(ok)) => {
+                            match ok {
+                                libp2p::kad::GetRecordOk::FoundRecord(peer_record) => {
+                                    tracing::info!(
+                                        "Kademlia GetRecord query {id}: found record with {} bytes",
+                                        peer_record.record.value.len()
+                                    );
+                                    // Try to parse as a PeerRecord and save to cache.
+                                    if let Ok(rec) =
+                                        serde_json::from_slice::<peer_cache::PeerRecord>(&peer_record.record.value)
+                                    {
+                                        if !rec.peer_id.is_empty()
+                                            && !rec.multiaddrs.is_empty()
+                                        {
+                                            if let Err(e) = peer_cache.save_peer(&rec) {
+                                                tracing::warn!(
+                                                    "Failed to save DHT-discovered peer {}: {e}",
+                                                    rec.peer_id
+                                                );
+                                            } else {
+                                                tracing::info!(
+                                                    "Saved DHT-discovered peer {} to cache",
+                                                    rec.peer_id
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                libp2p::kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {
+                                    tracing::debug!("Kademlia GetRecord query {id} finished");
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::debug!("Kademlia query {id} progressed: {result:?}");
+                        }
+                    }
                 }
                 _ => {
                     tracing::trace!("Kademlia event: {event:?}");
@@ -318,7 +508,7 @@ fn handle_swarm_event(
             }
         }
 
-        // ── Request-Response ──────────────────────────────────────────────
+        // ── Request-Response (chat) ───────────────────────────────────────
         SwarmEvent::Behaviour(network::AppBehaviourEvent::RequestResponse(event)) => {
             match event {
                 libp2p::request_response::Event::Message {
@@ -377,6 +567,83 @@ fn handle_swarm_event(
                     request_id,
                 } => {
                     tracing::debug!("Response sent to {peer} (req {request_id})");
+                }
+            }
+        }
+
+        // ── PEX (Peer Exchange) ───────────────────────────────────────────
+        SwarmEvent::Behaviour(network::AppBehaviourEvent::Pex(event)) => {
+            match event {
+                libp2p::request_response::Event::Message {
+                    peer,
+                    message,
+                    ..
+                } => {
+                    match message {
+                        libp2p::request_response::Message::Request {
+                            request,
+                            channel,
+                            ..
+                        } => {
+                            tracing::info!(
+                                "PEX message from {peer}: {} peers",
+                                request.peers.len()
+                            );
+                            // Validate and save received peers to cache.
+                            for record in &request.peers {
+                                if !record.peer_id.is_empty()
+                                    && !record.multiaddrs.is_empty()
+                                    // Don't save our own peer record from PEX.
+                                    && record.peer_id != our_peer_id.to_string()
+                                {
+                                    if let Err(e) = peer_cache.save_peer(record) {
+                                        tracing::warn!(
+                                            "Failed to save PEX peer {}: {e}",
+                                            record.peer_id
+                                        );
+                                    }
+                                }
+                            }
+                            // Acknowledge.
+                            let _ = swarm
+                                .behaviour_mut()
+                                .pex
+                                .send_response(channel, PexResponse { received: true });
+                        }
+                        libp2p::request_response::Message::Response {
+                            response,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                "PEX response from {peer}: received={}",
+                                response.received
+                            );
+                        }
+                    }
+                }
+                libp2p::request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                } => {
+                    tracing::warn!(
+                        "PEX outbound failure to {peer} (req {request_id}): {error}"
+                    );
+                }
+                libp2p::request_response::Event::InboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                } => {
+                    tracing::warn!(
+                        "PEX inbound failure from {peer} (req {request_id:?}): {error}"
+                    );
+                }
+                libp2p::request_response::Event::ResponseSent {
+                    peer,
+                    request_id,
+                } => {
+                    tracing::debug!("PEX response sent to {peer} (req {request_id})");
                 }
             }
         }

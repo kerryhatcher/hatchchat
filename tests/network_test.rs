@@ -7,8 +7,14 @@ use libp2p::core::Multiaddr;
 use libp2p::identity::Keypair;
 use network::{
     build_behaviour, build_transport, close_relayed_connections, filter_addresses,
-    is_direct_address, is_internet_address, ChatMessage, ChatResponse,
+    is_direct_address, is_internet_address, ChatMessage, ChatResponse, PeerExchangeMessage,
+    PexResponse,
 };
+
+#[path = "../src/peer_cache.rs"]
+mod peer_cache;
+
+use peer_cache::{current_timestamp, PeerRecord};
 
 #[test]
 fn test_keypair_and_peer_id() {
@@ -184,4 +190,75 @@ async fn test_close_relayed_connections_no_op() {
     // No tracked relayed connections — should not panic.
     close_relayed_connections(&mut swarm, &mut relayed_conns, peer_id);
     assert!(relayed_conns.is_empty());
+}
+
+// ── Phase 3 tests: PEX message serialization ───────────────────────────────
+
+#[test]
+fn test_pex_message_serialization() {
+    let record = PeerRecord {
+        peer_id: "12D3KooWTest".to_string(),
+        multiaddrs: vec!["/ip4/1.2.3.4/tcp/4001".to_string()],
+        i2p_destination: None,
+        last_seen: 1234567890,
+        connection_count: 1,
+        rtt_ms: None,
+        is_relay: false,
+        is_public: true,
+    };
+    let msg = PeerExchangeMessage {
+        peers: vec![record.clone()],
+        timestamp: current_timestamp(),
+    };
+    let json = serde_json::to_string(&msg).expect("serialize");
+    let decoded: PeerExchangeMessage = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(decoded.peers.len(), 1);
+    assert_eq!(decoded.peers[0].peer_id, "12D3KooWTest");
+    assert_eq!(decoded.peers[0].multiaddrs, record.multiaddrs);
+}
+
+#[test]
+fn test_pex_response_serialization() {
+    let resp = PexResponse { received: true };
+    let json = serde_json::to_string(&resp).expect("serialize");
+    let decoded: PexResponse = serde_json::from_str(&json).expect("deserialize");
+    assert!(decoded.received);
+}
+
+#[test]
+fn test_pex_message_empty() {
+    let msg = PeerExchangeMessage {
+        peers: vec![],
+        timestamp: 0,
+    };
+    let json = serde_json::to_string(&msg).expect("serialize");
+    let decoded: PeerExchangeMessage = serde_json::from_str(&json).expect("deserialize");
+    assert!(decoded.peers.is_empty());
+    assert_eq!(decoded.timestamp, 0);
+}
+
+#[test]
+fn test_pex_message_multiple_peers() {
+    let peers: Vec<PeerRecord> = (0..5)
+        .map(|i| PeerRecord {
+            peer_id: format!("peer{i}"),
+            multiaddrs: vec![format!("/ip4/1.2.3.{i}/tcp/400{i}")],
+            i2p_destination: None,
+            last_seen: 1000 + i,
+            connection_count: i as u32,
+            rtt_ms: Some(i as u32 * 10),
+            is_relay: i % 2 == 0,
+            is_public: true,
+        })
+        .collect();
+    let msg = PeerExchangeMessage {
+        peers,
+        timestamp: 99999,
+    };
+    let json = serde_json::to_string(&msg).expect("serialize");
+    let decoded: PeerExchangeMessage = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(decoded.peers.len(), 5);
+    assert_eq!(decoded.timestamp, 99999);
+    assert_eq!(decoded.peers[2].peer_id, "peer2");
+    assert_eq!(decoded.peers[2].rtt_ms, Some(20));
 }
