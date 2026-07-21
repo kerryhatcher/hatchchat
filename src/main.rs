@@ -198,6 +198,7 @@ async fn run_node(
 
     // Send initial info to the TUI.
     let _ = ui_tx.send(UiEvent::Info(format!("Local PeerId: {peer_id}")));
+    let _ = ui_tx.send(UiEvent::LocalPeerId(peer_id.to_string()));
     let _ = ui_tx.send(UiEvent::Info(format!(
         "Subscribed to gossipsub topic: {}",
         network::GOSSIPSUB_TOPIC

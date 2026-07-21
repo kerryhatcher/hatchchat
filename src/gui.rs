@@ -23,6 +23,7 @@ enum EventKind { System, Chat, Warn, Info }
 #[derive(Clone)]
 struct LogEntry { text: String, kind: EventKind }
 
+#[allow(dead_code)]
 struct ConnPeer { peer_id: String, addr: String, direct: bool }
 struct DiscPeer { peer_id: String, addr: String, source: String }
 
@@ -61,7 +62,11 @@ impl GuiState {
 
 fn short_pid(id: &str) -> String {
     const MAX: usize = 20;
-    if id.len() <= MAX { id.to_string() } else { format!("{}...", &id[..MAX - 3]) }
+    if id.chars().count() <= MAX {
+        id.to_string()
+    } else {
+        format!("{}...", id.chars().take(MAX - 3).collect::<String>())
+    }
 }
 
 fn apply_ui_event(state: &mut GuiState, event: UiEvent) {
@@ -69,6 +74,7 @@ fn apply_ui_event(state: &mut GuiState, event: UiEvent) {
         UiEvent::Info(m) => state.push(m, EventKind::Info),
         UiEvent::Warn(m) => state.push(m, EventKind::Warn),
         UiEvent::CacheCount(n) => state.cache_count = n,
+        UiEvent::LocalPeerId(id) => state.our_peer_id = id,
         UiEvent::NatStatus(s) => {
             state.nat_status = s.clone();
             state.push(format!("NAT status: {s}"), EventKind::System);
@@ -255,11 +261,12 @@ async fn gui_main(
             state.selected_peer = (state.selected_peer + 1) % state.connected_peers.len();
         }
         if is_key_pressed(KeyCode::Enter) && !state.input.is_empty() {
-            let text = std::mem::take(&mut state.input);
             if shift {
+                let text = std::mem::take(&mut state.input);
                 let _ = action_tx.try_send(UserAction::Broadcast { text });
             } else if let Some(p) = state.connected_peers.get(state.selected_peer) {
                 if let Ok(pid) = p.peer_id.parse::<PeerId>() {
+                    let text = std::mem::take(&mut state.input);
                     let _ = action_tx.try_send(UserAction::SendMessage { peer_id: pid, text });
                 }
             }
@@ -284,6 +291,9 @@ mod tests {
 
         apply_ui_event(&mut s, UiEvent::CacheCount(7));
         assert_eq!(s.cache_count, 7);
+
+        apply_ui_event(&mut s, UiEvent::LocalPeerId("x".to_string()));
+        assert_eq!(s.our_peer_id, "x");
 
         apply_ui_event(&mut s, UiEvent::NatStatus("Public".into()));
         assert_eq!(s.nat_status, "Public");
