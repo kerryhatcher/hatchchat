@@ -1,16 +1,18 @@
 [package]
 name = "hatch-chat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-reticulum = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git" }
+libp2p = { version = "0.54", features = [
+    "tokio", "tcp", "quic", "dns", "noise", "yamux",
+    "kad", "mdns", "gossipsub", "identify", "request-response", "cbor", "macros"
+] }
 tokio = { version = "1", features = ["full"] }
-ratatui = "0.26"
-crossterm = "0.27"
-rand_core = "0.6"
-log = "0.4"
-env_logger = "0.11"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-socket2 = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
