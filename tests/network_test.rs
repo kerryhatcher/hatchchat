@@ -1,4 +1,4 @@
-// Tests for the libp2p-based networking module (Phase 1).
+// Tests for the libp2p-based networking module (Phases 1 & 2).
 
 #[path = "../src/network.rs"]
 mod network;
@@ -6,8 +6,8 @@ mod network;
 use libp2p::core::Multiaddr;
 use libp2p::identity::Keypair;
 use network::{
-    build_behaviour, build_transport, filter_addresses, is_internet_address, ChatMessage,
-    ChatResponse,
+    build_behaviour, build_transport, close_relayed_connections, filter_addresses,
+    is_direct_address, is_internet_address, ChatMessage, ChatResponse,
 };
 
 #[test]
@@ -21,16 +21,28 @@ fn test_keypair_and_peer_id() {
 
 #[test]
 fn test_build_transport() {
-    // Building the transport should not panic.
+    // Building the transport should not panic and should return the
+    // relay client behaviour alongside the boxed transport (Phase 2).
     let keypair = Keypair::generate_ed25519();
-    let _transport = build_transport(&keypair);
+    let (transport, relay_client_behaviour) = build_transport(&keypair);
+    // The transport is boxed; we just ensure it was created.
+    let _ = transport;
+    // The relay client behaviour should also have been created.
+    let _ = relay_client_behaviour;
 }
 
 #[tokio::test]
 async fn test_build_behaviour() {
     let keypair = Keypair::generate_ed25519();
     let peer_id = keypair.public().to_peer_id();
-    let _behaviour = build_behaviour(&keypair, peer_id);
+    let (_, relay_client_behaviour) = build_transport(&keypair);
+    let behaviour = build_behaviour(&keypair, peer_id, relay_client_behaviour);
+    // Verify all Phase 2 components are present by checking the NAT status
+    // (AutoNAT starts in Unknown state).
+    assert_eq!(
+        behaviour.autonat.nat_status(),
+        libp2p::autonat::NatStatus::Unknown
+    );
 }
 
 #[test]
@@ -116,4 +128,60 @@ fn test_filter_addresses_disabled() {
     // When no_local is false, nothing should be filtered.
     let filtered = filter_addresses(addrs, false);
     assert_eq!(filtered.len(), 2);
+}
+
+// ── Phase 2 tests: is_direct_address & close_relayed_connections ───────────
+
+#[test]
+fn test_is_direct_address_tcp() {
+    let addr: Multiaddr = "/ip4/1.2.3.4/tcp/4001".parse().unwrap();
+    assert!(is_direct_address(&addr));
+}
+
+#[test]
+fn test_is_direct_address_quic() {
+    let addr: Multiaddr = "/ip4/1.2.3.4/udp/4001/quic-v1".parse().unwrap();
+    assert!(is_direct_address(&addr));
+}
+
+#[test]
+fn test_is_direct_address_relayed() {
+    // A relayed address contains /p2p-circuit. Use real PeerIds.
+    let keypair = Keypair::generate_ed25519();
+    let relay_peer_id = keypair.public().to_peer_id();
+    let dst_keypair = Keypair::generate_ed25519();
+    let dst_peer_id = dst_keypair.public().to_peer_id();
+    let addr: Multiaddr = format!(
+        "/ip4/1.2.3.4/tcp/4001/p2p/{relay_peer_id}/p2p-circuit/p2p/{dst_peer_id}"
+    )
+    .parse()
+    .unwrap();
+    assert!(!is_direct_address(&addr));
+}
+
+#[test]
+fn test_is_direct_address_p2p_circuit_only() {
+    let addr: Multiaddr = "/p2p-circuit".parse().unwrap();
+    assert!(!is_direct_address(&addr));
+}
+
+#[tokio::test]
+async fn test_close_relayed_connections_no_op() {
+    // When there are no tracked relayed connections, the function should
+    // be a no-op (just removes the empty entry if present).
+    let keypair = Keypair::generate_ed25519();
+    let peer_id = keypair.public().to_peer_id();
+    let (transport, relay_client_behaviour) = build_transport(&keypair);
+    let behaviour = build_behaviour(&keypair, peer_id, relay_client_behaviour);
+    let mut swarm = libp2p::Swarm::new(
+        transport,
+        behaviour,
+        peer_id,
+        libp2p::swarm::Config::with_tokio_executor(),
+    );
+    let mut relayed_conns: std::collections::HashMap<libp2p::PeerId, Vec<libp2p::swarm::ConnectionId>> =
+        std::collections::HashMap::new();
+    // No tracked relayed connections — should not panic.
+    close_relayed_connections(&mut swarm, &mut relayed_conns, peer_id);
+    assert!(relayed_conns.is_empty());
 }

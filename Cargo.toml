@@ -1,12 +1,13 @@
 [package]
 name = "hatch-chat"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
 libp2p = { version = "0.54", features = [
     "tokio", "tcp", "quic", "dns", "noise", "yamux",
-    "kad", "mdns", "gossipsub", "identify", "request-response", "cbor", "macros"
+    "kad", "mdns", "gossipsub", "identify", "request-response", "cbor", "macros",
+    "autonat", "relay", "dcutr"
 ] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

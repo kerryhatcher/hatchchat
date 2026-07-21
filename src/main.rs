@@ -11,8 +11,10 @@ use futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use network::{
-    build_behaviour, build_transport, filter_addresses, is_internet_address, ChatResponse,
+    build_behaviour, build_transport, close_relayed_connections, filter_addresses,
+    is_direct_address, is_internet_address, ChatResponse,
 };
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// CLI arguments.
@@ -52,8 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Local PeerId: {peer_id}");
 
     // Build transport and behaviour.
-    let transport = build_transport(&keypair);
-    let behaviour = build_behaviour(&keypair, peer_id);
+    let (transport, relay_client_behaviour) = build_transport(&keypair);
+    let behaviour = build_behaviour(&keypair, peer_id, relay_client_behaviour);
 
     let mut swarm: Swarm<network::AppBehaviour> = Swarm::new(
         transport,
@@ -106,6 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(ctrl_c_tx.send(()));
     });
 
+    // Track relayed connections per peer so we can close them when a
+    // direct connection is established (connection priority).
+    let mut relayed_conns: HashMap<PeerId, Vec<libp2p::swarm::ConnectionId>> = HashMap::new();
+
     tracing::info!("Starting swarm event loop…  Press Ctrl+C to quit.");
 
     loop {
@@ -118,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = swarm.behaviour_mut().kademlia.bootstrap();
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, no_local);
+                handle_swarm_event(event, &mut swarm, no_local, &mut relayed_conns);
             }
         }
     }
@@ -152,6 +158,7 @@ fn handle_swarm_event(
     event: SwarmEvent<network::AppBehaviourEvent>,
     swarm: &mut Swarm<network::AppBehaviour>,
     no_local: bool,
+    relayed_conns: &mut HashMap<PeerId, Vec<libp2p::swarm::ConnectionId>>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -161,15 +168,41 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished {
             peer_id,
             connection_id,
+            endpoint,
             ..
         } => {
-            tracing::info!("Connected to peer {peer_id} (conn {connection_id})");
+            let remote_addr = endpoint.get_remote_address();
+            if is_direct_address(remote_addr) {
+                tracing::info!(
+                    "Direct connection to peer {peer_id} (conn {connection_id}) at {remote_addr}"
+                );
+                // Connection priority: close any relayed connections to this peer.
+                close_relayed_connections(swarm, relayed_conns, peer_id);
+            } else {
+                tracing::info!(
+                    "Relayed connection to peer {peer_id} (conn {connection_id}) via {remote_addr}"
+                );
+                relayed_conns
+                    .entry(peer_id)
+                    .or_default()
+                    .push(connection_id);
+            }
         }
 
         SwarmEvent::ConnectionClosed {
-            peer_id, cause, ..
+            peer_id,
+            connection_id,
+            cause,
+            ..
         } => {
-            tracing::info!("Connection closed with {peer_id}: {cause:?}");
+            tracing::info!("Connection closed with {peer_id} (conn {connection_id}): {cause:?}");
+            // Remove the closed connection from our relayed tracking.
+            if let Some(conns) = relayed_conns.get_mut(&peer_id) {
+                conns.retain(|id| *id != connection_id);
+                if conns.is_empty() {
+                    relayed_conns.remove(&peer_id);
+                }
+            }
         }
 
         SwarmEvent::OutgoingConnectionError {
@@ -344,6 +377,140 @@ fn handle_swarm_event(
                     request_id,
                 } => {
                     tracing::debug!("Response sent to {peer} (req {request_id})");
+                }
+            }
+        }
+
+        // ── AutoNAT ───────────────────────────────────────────────────────
+        SwarmEvent::Behaviour(network::AppBehaviourEvent::Autonat(event)) => {
+            match event {
+                libp2p::autonat::Event::StatusChanged { old, new } => {
+                    tracing::info!("AutoNAT status changed: {old:?} -> {new:?}");
+                    match &new {
+                        libp2p::autonat::NatStatus::Public(addr) => {
+                            tracing::info!(
+                                "AutoNAT: publicly reachable at {addr} \
+                                 — relay server would be enabled (requires \
+                                 swarm restart in libp2p 0.54)"
+                            );
+                        }
+                        libp2p::autonat::NatStatus::Private => {
+                            tracing::info!(
+                                "AutoNAT: behind NAT — need relay + hole punching"
+                            );
+                        }
+                        libp2p::autonat::NatStatus::Unknown => {
+                            tracing::info!("AutoNAT: NAT status unknown");
+                        }
+                    }
+                }
+                libp2p::autonat::Event::OutboundProbe(probe) => {
+                    tracing::debug!("AutoNAT outbound probe: {probe:?}");
+                }
+                libp2p::autonat::Event::InboundProbe(probe) => {
+                    tracing::debug!("AutoNAT inbound probe: {probe:?}");
+                }
+            }
+        }
+
+        // ── DCUtR ────────────────────────────────────────────────────────
+        SwarmEvent::Behaviour(network::AppBehaviourEvent::Dcutr(event)) => {
+            match event.result {
+                Ok(connection_id) => {
+                    tracing::info!(
+                        "DCUtR: hole punch succeeded with {} (conn {connection_id})",
+                        event.remote_peer_id
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "DCUtR: hole punch failed with {}: {error}",
+                        event.remote_peer_id
+                    );
+                    // Connection stays on relay — still works, just higher latency.
+                }
+            }
+        }
+
+        // ── Relay Client ─────────────────────────────────────────────────
+        SwarmEvent::Behaviour(network::AppBehaviourEvent::RelayClient(event)) => {
+            match event {
+                libp2p::relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    renewal,
+                    limit,
+                } => {
+                    tracing::info!(
+                        "Relay client: reservation accepted with relay {relay_peer_id} \
+                         (renewal={renewal}, limit={limit:?})"
+                    );
+                }
+                libp2p::relay::client::Event::OutboundCircuitEstablished {
+                    relay_peer_id,
+                    limit,
+                } => {
+                    tracing::info!(
+                        "Relay client: outbound circuit established via {relay_peer_id} \
+                         (limit={limit:?})"
+                    );
+                }
+                libp2p::relay::client::Event::InboundCircuitEstablished {
+                    src_peer_id,
+                    limit,
+                } => {
+                    tracing::info!(
+                        "Relay client: inbound circuit established from {src_peer_id} \
+                         (limit={limit:?})"
+                    );
+                }
+            }
+        }
+
+        // ── Relay Server ─────────────────────────────────────────────────
+        SwarmEvent::Behaviour(network::AppBehaviourEvent::RelayServer(event)) => {
+            match event {
+                libp2p::relay::Event::ReservationReqAccepted {
+                    src_peer_id,
+                    renewed,
+                } => {
+                    tracing::info!(
+                        "Relay server: reservation accepted from {src_peer_id} (renewed={renewed})"
+                    );
+                }
+                libp2p::relay::Event::ReservationReqDenied { src_peer_id } => {
+                    tracing::info!("Relay server: reservation denied for {src_peer_id}");
+                }
+                libp2p::relay::Event::ReservationTimedOut { src_peer_id } => {
+                    tracing::info!("Relay server: reservation timed out for {src_peer_id}");
+                }
+                libp2p::relay::Event::CircuitReqAccepted {
+                    src_peer_id,
+                    dst_peer_id,
+                } => {
+                    tracing::info!(
+                        "Relay server: circuit request accepted: {src_peer_id} -> {dst_peer_id}"
+                    );
+                }
+                libp2p::relay::Event::CircuitReqDenied {
+                    src_peer_id,
+                    dst_peer_id,
+                } => {
+                    tracing::info!(
+                        "Relay server: circuit request denied: {src_peer_id} -> {dst_peer_id}"
+                    );
+                }
+                libp2p::relay::Event::CircuitClosed {
+                    src_peer_id,
+                    dst_peer_id,
+                    error,
+                } => {
+                    tracing::info!(
+                        "Relay server: circuit closed: {src_peer_id} -> {dst_peer_id} (error={error:?})"
+                    );
+                }
+                // Deprecated variants are logged at trace level.
+                _ => {
+                    tracing::trace!("Relay server event: {event:?}");
                 }
             }
         }
