@@ -6,28 +6,30 @@ default:
 build:
     cargo build
 
-# Run in LAN mode (mDNS discovery — two instances on the same machine find each other instantly)
+# Run with default passphrase (two instances on any network find each other)
 run:
     cargo run
 
-# Run with a specific port (LAN mode)
-run-port port:
-    cargo run -- --port {{port}}
+# Run with a custom passphrase
+run-passphrase passphrase:
+    cargo run -- --passphrase {{passphrase}}
 
-# Run with a bootstrap node (LAN mode)
-run-bootstrap bootstrap:
-    cargo run -- --bootstrap {{bootstrap}}
+# Run with a display name
+run-named passphrase name:
+    cargo run -- --passphrase {{passphrase}} --name {{name}}
 
-# Run as a bootstrap seed node (LAN mode)
-run-seed:
-    cargo run -- --bootstrap-seed
+# Run the desktop GUI
+run-gui:
+    cargo run -- gui
 
-# Run in internet-only mode (--no-local, disables mDNS, filters local addresses)
-# Requires a public bootstrap node to discover peers.
-# Example: just run-no-local --bootstrap /ip4/1.2.3.4/tcp/4001/p2p/Qm...
-run-no-local *args:
-    cargo run -- --no-local {{args}}
+# Run GUI with custom passphrase
+run-gui-passphrase passphrase:
+    cargo run -- gui --passphrase {{passphrase}}
 
 # Run tests
 test:
     cargo test
+
+# Build without GUI dependencies (headless)
+build-headless:
+    cargo build --no-default-features

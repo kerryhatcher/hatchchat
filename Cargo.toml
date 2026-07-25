@@ -1,33 +1,49 @@
 [package]
 name = "hatch-chat"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
-description = "Hearty peer-to-peer chat over libp2p, with a terminal UI (default) and an optional ply-engine desktop GUI."
+description = "Hearty peer-to-peer chat over iroh, with zero-knowledge rendezvous via Mainline DHT and a terminal UI (default) with an optional ply-engine desktop GUI."
 license = "MIT"
 repository = "https://github.com/kerryhatcher/hatchchat"
 readme = "README.md"
-keywords = ["p2p", "chat", "libp2p", "tui", "gui"]
+keywords = ["p2p", "chat", "iroh", "tui", "gui"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-libp2p = { version = "0.54", features = [
-    "tokio", "tcp", "quic", "dns", "noise", "yamux",
-    "kad", "mdns", "gossipsub", "identify", "request-response", "cbor", "macros",
-    "autonat", "relay", "dcutr"
-] }
+# ── iroh stack ──────────────────────────────────────────────────────────
+iroh = "0.98"
+iroh-gossip = "0.98"
+iroh-gossip-rendezvous = "0.1"
+
+# ── async runtime ──────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-futures = "0.3"
-async-trait = "0.1"
+futures-lite = "2"
+
+# ── serialization ──────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# ── CLI ────────────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive"] }
+
+# ── logging ────────────────────────────────────────────────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── persistent peer cache ──────────────────────────────────────────────
 redb = "2"
+
+# ── TUI ────────────────────────────────────────────────────────────────
 ratatui = "0.26"
 crossterm = "0.27"
+
+# ── GUI (optional) ─────────────────────────────────────────────────────
 ply-engine = { version = "1.1.1", optional = true }
 macroquad = { package = "macroquad-ply", version = "0.4.14", optional = true }
+
+# ── misc ───────────────────────────────────────────────────────────────
+rand = "0.8"
+anyhow = "1"
 
 [features]
 default = ["gui"]

@@ -1,28 +1,51 @@
 # hatch-chat
 
-Hearty peer-to-peer chat over [libp2p](https://libp2p.io/). Peers discover each
-other on the LAN (mDNS), the DHT (Kademlia), via bootstrap nodes, and peer
-exchange (PEX), with NAT traversal (AutoNAT, relay, DCUtR hole punching). State
-(known peers) persists in an embedded [redb](https://www.redb.org/) cache.
+Hearty peer-to-peer chat over [iroh](https://iroh.computer). Peers discover each
+other automatically via the BitTorrent Mainline DHT using
+[iroh-gossip-rendezvous](https://crates.io/crates/iroh-gossip-rendezvous) —
+**two nodes sharing only a passphrase find each other with zero configuration.**
 
-Two front-ends share one networking core over an internal event/action channel
-contract:
+No bootstrap servers. No pre-shared addresses. No manual config. Just a
+passphrase.
+
+Two front-ends share one networking core over an internal event/action
+channel contract:
 
 - **TUI** (default) — a [ratatui](https://ratatui.rs/) terminal interface.
 - **GUI** (optional) — a [ply-engine](https://github.com/TheRedDeveloper/ply-engine)
   desktop window, behind the default-on `gui` cargo feature.
 
-Both UIs keep chat messages in a dedicated pane and route system/discovery
-events to a separate log.
+## How it works
+
+```
+Alice                    Mainline DHT                   Bob
+  │                           │                           │
+  │── publish EndpointId ────▶│                           │
+  │                           │◀──── publish EndpointId ──│
+  │                           │                           │
+  │◀───────── discover ──────│────── discover ──────────▶│
+  │                           │                           │
+  │────────────── direct QUIC connection ────────────────▶│
+  │◀───────────── (NAT traversal + relay fallback) ──────│
+```
+
+1. Each node derives DHT slot keys from the shared passphrase via HKDF
+2. Nodes publish their iroh `EndpointId` to the Mainline DHT
+3. Nodes periodically scan DHT slots for unknown peers
+4. Discovered peers are dialed via iroh (QUIC + NAT traversal + relay fallback)
+5. Chat messages flow over iroh-gossip (epidemic broadcast trees)
 
 ## Install / run
 
 ```bash
-# Terminal UI (default)
+# Terminal UI (default passphrase)
 cargo run
 
+# With a custom passphrase and display name
+cargo run -- --passphrase "our-secret-room" --name alice
+
 # Desktop GUI
-cargo run -- gui
+cargo run -- gui --passphrase "our-secret-room" --name bob
 
 # Lean, headless build (no GUI / GPU dependencies)
 cargo build --no-default-features
@@ -31,12 +54,20 @@ cargo build --no-default-features
 ## Options
 
 ```
---port <PORT>          Port to listen on (0 = random)
---no-local             Internet-only mode (disables mDNS + local addresses)
---bootstrap <MADDR>    Bootstrap node multiaddr (repeatable)
---bootstrap-seed       Act as a bootstrap seed node
---data-dir <DIR>       Persistent state directory (default: .hatch-chat)
+-p, --passphrase <PHRASE>   Shared passphrase for rendezvous [default: hatch-chat-default]
+-n, --name <NAME>            Your display name in the chat
+    --data-dir <DIR>         Persistent state directory [default: .hatch-chat]
 ```
+
+## Requirements
+
+- Rust 1.75+
+- Internet connection (UDP access for DHT + QUIC)
+- Same passphrase on all peers
+
+No port forwarding, firewall configuration, or bootstrap nodes needed.
+iroh handles NAT traversal and falls back to public relay servers when
+direct connections aren't possible.
 
 ## License
 

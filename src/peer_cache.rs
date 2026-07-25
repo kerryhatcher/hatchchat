@@ -1,10 +1,11 @@
 //! Persistent peer address store backed by an embedded redb database.
 //!
-//! Phase 3 — Resilient Discovery.
-//!
 //! [`PeerRecord`] captures everything we know about a remote peer so that
-//! we can reconnect after an app restart without re-discovering from
-//! scratch.  [`PeerCache`] wraps a redb database file on disk.
+//! we can reconnect after an app restart.  [`PeerCache`] wraps a redb
+//! database file on disk.
+//!
+//! In the iroh-based architecture, peer records store EndpointId strings
+//! and metadata rather than libp2p multiaddrs.
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,11 @@ use std::path::Path;
 /// All the information we persist about a single remote peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
-    /// Base58-encoded [`libp2p::PeerId`].
+    /// iroh EndpointId as a string.
     pub peer_id: String,
-    /// Every known multiaddress for this peer (as strings).
+    /// Known addresses or discovery sources for this peer.
     pub multiaddrs: Vec<String>,
-    /// I2P destination string — reserved for Phase 4.
+    /// I2P destination string — reserved for future use.
     #[serde(default)]
     pub i2p_destination: Option<String>,
     /// Unix timestamp (seconds) of the last successful connection.
@@ -29,7 +30,7 @@ pub struct PeerRecord {
     /// Measured round-trip time in milliseconds, if known.
     #[serde(default)]
     pub rtt_ms: Option<u32>,
-    /// Does this peer offer Circuit Relay v2 service?
+    /// Does this peer offer relay service?
     #[serde(default)]
     pub is_relay: bool,
     /// Is this peer publicly reachable (not behind NAT)?
@@ -39,7 +40,6 @@ pub struct PeerRecord {
 
 // ── Cache ───────────────────────────────────────────────────────────────────
 
-/// redb table definition: peer-id-string → JSON-encoded `PeerRecord`.
 const PEER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 
 /// Persistent peer address store.
@@ -56,10 +56,8 @@ impl PeerCache {
     /// The directory is created if it does not exist.  The database file
     /// is placed at `<dir>/peer_cache.redb`.
     ///
-    /// If the database is already open (e.g. another instance is running
-    /// in the same data directory), falls back to a unique temp directory
-    /// so that multiple instances can run simultaneously on the same
-    /// machine for testing.
+    /// If the database is already open, falls back to a unique temp
+    /// directory so multiple instances can run simultaneously.
     pub fn open(dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(dir).ok();
         let db_path = dir.join("peer_cache.redb");
@@ -67,8 +65,6 @@ impl PeerCache {
         match Database::create(&db_path) {
             Ok(db) => Self::init_tables(db),
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
-                // Another process has the database locked.  Fall back to a
-                // unique temp directory so this instance can still run.
                 let fallback_dir = std::env::temp_dir().join(format!(
                     "hatch-chat-peer-cache-{}",
                     std::process::id()
@@ -87,7 +83,6 @@ impl PeerCache {
         }
     }
 
-    /// Create the peer table if it doesn't already exist.
     fn init_tables(db: Database) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let txn = db.begin_write()?;
         let _ = txn.open_table(PEER_TABLE)?;
@@ -96,7 +91,10 @@ impl PeerCache {
     }
 
     /// Insert or update a peer record.
-    pub fn save_peer(&self, record: &PeerRecord) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn save_peer(
+        &self,
+        record: &PeerRecord,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(PEER_TABLE)?;
@@ -107,7 +105,8 @@ impl PeerCache {
         Ok(())
     }
 
-    /// Look up a single peer by base58 PeerId string.
+    /// Look up a single peer by its EndpointId string.
+    #[allow(dead_code)]
     pub fn get_peer(
         &self,
         peer_id: &str,
@@ -125,7 +124,9 @@ impl PeerCache {
     }
 
     /// Return every cached peer record.
-    pub fn all_peers(&self) -> Result<Vec<PeerRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn all_peers(
+        &self,
+    ) -> Result<Vec<PeerRecord>, Box<dyn std::error::Error + Send + Sync>> {
         let txn = self.db.begin_read()?;
         let table = match txn.open_table(PEER_TABLE) {
             Ok(t) => t,
@@ -142,6 +143,7 @@ impl PeerCache {
     }
 
     /// Remove peers whose `last_seen` is older than `max_age_secs` ago.
+    #[allow(dead_code)]
     pub fn prune_stale(
         &self,
         max_age_secs: u64,

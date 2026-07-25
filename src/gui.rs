@@ -1,12 +1,11 @@
 //! Desktop GUI for hatch-chat, built on ply-engine (macroquad backend).
 //!
 //! Alternate consumer of the same UiEvent/UserAction channel contract the
-//! TUI uses. Runs on the main thread (miniquad requires it); the swarm runs
-//! on a background thread. Full rendering lands in a later step.
+//! TUI uses. Runs on the main thread (miniquad requires it); the iroh node
+//! runs on a background thread.
 #![cfg(feature = "gui")]
 
 use crate::tui::{UiEvent, UserAction};
-use libp2p::PeerId;
 use macroquad::prelude::*;
 use ply_engine::prelude::*;
 use std::sync::mpsc;
@@ -18,24 +17,31 @@ static DEFAULT_FONT: FontAsset = FontAsset::Bytes {
 };
 
 #[derive(Clone)]
-enum EventKind { System, Chat, Warn, Info }
+enum EventKind {
+    System,
+    Chat,
+    Warn,
+    Info,
+}
 
 #[derive(Clone)]
-struct LogEntry { text: String, kind: EventKind }
+struct LogEntry {
+    text: String,
+    kind: EventKind,
+}
 
-#[allow(dead_code)]
-struct ConnPeer { peer_id: String, addr: String, direct: bool }
-struct DiscPeer { peer_id: String, addr: String, source: String }
+struct ConnPeer {
+    peer_id: String,
+    #[allow(dead_code)]
+    addr: String,
+    direct: bool,
+}
 
 struct GuiState {
-    /// Chat messages only. Capped separately so event spam can't evict chat.
     chat: Vec<LogEntry>,
-    /// System / info / warning event log (everything that isn't chat).
     events: Vec<LogEntry>,
     connected_peers: Vec<ConnPeer>,
-    discovered_peers: Vec<DiscPeer>,
     our_peer_id: String,
-    nat_status: String,
     cache_count: usize,
     input: String,
     selected_peer: usize,
@@ -47,9 +53,7 @@ impl GuiState {
             chat: Vec::new(),
             events: Vec::new(),
             connected_peers: Vec::new(),
-            discovered_peers: Vec::new(),
             our_peer_id,
-            nat_status: "Unknown".to_string(),
             cache_count: 0,
             input: String::new(),
             selected_peer: 0,
@@ -57,8 +61,10 @@ impl GuiState {
     }
 
     fn push(&mut self, text: String, kind: EventKind) {
-        // Route chat to its own buffer so system-event spam can't evict it.
-        let entry = LogEntry { text, kind: kind.clone() };
+        let entry = LogEntry {
+            text,
+            kind: kind.clone(),
+        };
         let (buf, cap) = match kind {
             EventKind::Chat => (&mut self.chat, 1000),
             _ => (&mut self.events, 500),
@@ -85,44 +91,39 @@ fn apply_ui_event(state: &mut GuiState, event: UiEvent) {
         UiEvent::Warn(m) => state.push(m, EventKind::Warn),
         UiEvent::CacheCount(n) => state.cache_count = n,
         UiEvent::LocalPeerId(id) => state.our_peer_id = id,
-        UiEvent::NatStatus(s) => {
-            state.nat_status = s.clone();
-            state.push(format!("NAT status: {s}"), EventKind::System);
-        }
-        UiEvent::ListenAddr(a) => state.push(format!("Listening on {a}"), EventKind::System),
-        UiEvent::RelayEvent(m) => state.push(format!("Relay: {m}"), EventKind::Info),
-        UiEvent::DhtRecord(m) => state.push(format!("DHT: {m}"), EventKind::Info),
-        UiEvent::HolePunch { peer_id, success } => {
-            let (msg, kind) = if success {
-                (format!("Hole punch succeeded with {}", short_pid(&peer_id)), EventKind::System)
-            } else {
-                (format!("Hole punch failed with {}", short_pid(&peer_id)), EventKind::Warn)
-            };
-            state.push(msg, kind);
-        }
         UiEvent::ChatMessage { from, text } => {
-            state.push(format!("[{}] {}", short_pid(&from), text), EventKind::Chat);
+            state.push(
+                format!("[{}] {}", from, text),
+                EventKind::Chat,
+            );
         }
-        UiEvent::PeerConnected { peer_id, addr, direct } => {
+        UiEvent::PeerConnected {
+            peer_id,
+            addr,
+            direct,
+        } => {
             if !state.connected_peers.iter().any(|p| p.peer_id == peer_id) {
-                state.connected_peers.push(ConnPeer { peer_id: peer_id.clone(), addr: addr.clone(), direct });
+                state.connected_peers.push(ConnPeer {
+                    peer_id: peer_id.clone(),
+                    addr: addr.clone(),
+                    direct,
+                });
             }
             let kind_str = if direct { "direct" } else { "relayed" };
-            state.push(format!("Connected to {} ({kind_str}) at {}", short_pid(&peer_id), addr), EventKind::System);
+            state.push(
+                format!("Connected to {} ({kind_str})", short_pid(&peer_id)),
+                EventKind::System,
+            );
         }
         UiEvent::PeerDisconnected { peer_id } => {
             state.connected_peers.retain(|p| p.peer_id != peer_id);
             if state.selected_peer >= state.connected_peers.len() {
                 state.selected_peer = state.connected_peers.len().saturating_sub(1);
             }
-            state.push(format!("Disconnected from {}", short_pid(&peer_id)), EventKind::System);
-        }
-        UiEvent::PeerDiscovered { peer_id, addr, source } => {
-            if !state.discovered_peers.iter().any(|p| p.peer_id == peer_id && p.addr == addr) {
-                state.discovered_peers.push(DiscPeer { peer_id: peer_id.clone(), addr: addr.clone(), source: source.clone() });
-                if state.discovered_peers.len() > 100 { state.discovered_peers.remove(0); }
-            }
-            state.push(format!("Discovered {} at {} via {}", short_pid(&peer_id), addr, source), EventKind::System);
+            state.push(
+                format!("Disconnected from {}", short_pid(&peer_id)),
+                EventKind::System,
+            );
         }
     }
 }
@@ -138,8 +139,6 @@ fn window_conf() -> Conf {
     }
 }
 
-/// Launch the GUI window on the current (main) thread. Blocks until the
-/// window closes. `ui_rx`/`action_tx` are the UI ends of the swarm channels.
 pub fn run_gui(
     ui_rx: mpsc::Receiver<UiEvent>,
     action_tx: tokio_mpsc::Sender<UserAction>,
@@ -154,7 +153,6 @@ async fn gui_main(
     action_tx: tokio_mpsc::Sender<UserAction>,
     our_peer_id: String,
 ) {
-    // Cooperate with the OS close button instead of hard-exiting.
     prevent_quit();
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     let mut state = GuiState::new(our_peer_id);
@@ -176,79 +174,119 @@ async fn gui_main(
 
         // 2. Build the UI tree.
         let mut ui = ply.begin();
-        ui.element().width(grow!()).height(grow!())
+        ui.element()
+            .width(grow!())
+            .height(grow!())
             .layout(|l| l.direction(LeftToRight).gap(8).padding(8))
             .children(|ui| {
-                // Left column: event log (scroll) + input.
-                ui.element().width(fixed!(650.0)).height(grow!())
+                // Left column: chat log + input.
+                ui.element()
+                    .width(fixed!(650.0))
+                    .height(grow!())
                     .layout(|l| l.direction(TopToBottom).gap(8))
                     .children(|ui| {
-                        // Scrollable chat log (chat messages only).
-                        ui.element().width(grow!()).height(grow!())
+                        // Scrollable chat log.
+                        ui.element()
+                            .width(grow!())
+                            .height(grow!())
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(4).padding(8))
-                            .overflow(|o| o.scroll_y().scrollbar(|s| s.width(4.0).thumb_color(0x666666).track_color(0x222222)))
+                            .overflow(|o| {
+                                o.scroll_y().scrollbar(|s| {
+                                    s.width(4.0)
+                                        .thumb_color(0x666666)
+                                        .track_color(0x222222)
+                                })
+                            })
                             .children(|ui| {
                                 ui.text("Chat", |t| t.font_size(16).color(0xFFFFFF));
                                 for entry in &state.chat {
-                                    ui.text(&entry.text, |t| t.font_size(18).color(0x66FF88));
+                                    ui.text(&entry.text, |t| {
+                                        t.font_size(18).color(0x66FF88)
+                                    });
                                 }
                             });
-                        // Input box (hand-rolled — render state.input as text; cursor is a trailing '_').
-                        ui.element().width(grow!()).height(fixed!(40.0))
+                        // Input box.
+                        ui.element()
+                            .width(grow!())
+                            .height(fixed!(40.0))
                             .background_color(0x000000)
                             .layout(|l| l.padding(8).align(Left, CenterY))
                             .children(|ui| {
-                                ui.text(&format!("> {}_", state.input), |t| t.font_size(20).color(0xFFFFFF));
+                                ui.text(&format!("> {}_", state.input), |t| {
+                                    t.font_size(20).color(0xFFFFFF)
+                                });
                             });
                     });
 
-                // Right column: connected + discovered + status + events.
-                ui.element().width(grow!()).height(grow!())
+                // Right column: connected + status + events.
+                ui.element()
+                    .width(grow!())
+                    .height(grow!())
                     .layout(|l| l.direction(TopToBottom).gap(8))
                     .children(|ui| {
-                        // Connected peers (selectable).
-                        ui.element().width(grow!()).height(fixed!(180.0))
+                        // Connected peers.
+                        ui.element()
+                            .width(grow!())
+                            .height(fixed!(180.0))
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
                             .overflow(|o| o.scroll_y())
                             .children(|ui| {
-                                ui.text("Peers (connected)", |t| t.font_size(16).color(0xFFFFFF));
+                                ui.text("Peers (connected)", |t| {
+                                    t.font_size(16).color(0xFFFFFF)
+                                });
                                 for (i, p) in state.connected_peers.iter().enumerate() {
                                     let tag = if p.direct { "D" } else { "R" };
                                     let sel = i == state.selected_peer;
                                     let color = if sel { 0xFFFF66 } else { 0xCCCCCC };
-                                    ui.text(&format!("{tag} {}", short_pid(&p.peer_id)), |t| t.font_size(16).color(color));
-                                }
-                            });
-                        // Discovered.
-                        ui.element().width(grow!()).height(fixed!(140.0))
-                            .background_color(0x1A1A1A)
-                            .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
-                            .overflow(|o| o.scroll_y())
-                            .children(|ui| {
-                                ui.text("Discovered", |t| t.font_size(16).color(0xFFFFFF));
-                                for p in &state.discovered_peers {
-                                    ui.text(&format!("{} ({})", short_pid(&p.peer_id), p.source), |t| t.font_size(16).color(0xAAAAAA));
+                                    ui.text(
+                                        &format!("{tag} {}", short_pid(&p.peer_id)),
+                                        |t| t.font_size(16).color(color),
+                                    );
                                 }
                             });
                         // Status.
-                        ui.element().width(grow!()).height(fixed!(150.0))
+                        ui.element()
+                            .width(grow!())
+                            .height(fixed!(120.0))
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
                             .children(|ui| {
                                 ui.text("Status", |t| t.font_size(16).color(0xFFFFFF));
-                                ui.text(&format!("PeerId: {}", short_pid(&state.our_peer_id)), |t| t.font_size(14).color(0xCCCCCC));
-                                ui.text(&format!("NAT: {}", state.nat_status), |t| t.font_size(14).color(0xCCCCCC));
-                                ui.text(&format!("Peers: {} connected", state.connected_peers.len()), |t| t.font_size(14).color(0xCCCCCC));
-                                ui.text(&format!("Cache: {} peers", state.cache_count), |t| t.font_size(14).color(0xCCCCCC));
-                                ui.text("Enter=send  Shift+Enter=broadcast  Tab=next peer  Esc=quit", |t| t.font_size(12).color(0x777777));
+                                ui.text(
+                                    &format!("ID: {}", short_pid(&state.our_peer_id)),
+                                    |t| t.font_size(14).color(0xCCCCCC),
+                                );
+                                ui.text(
+                                    &format!(
+                                        "Peers: {} connected",
+                                        state.connected_peers.len()
+                                    ),
+                                    |t| t.font_size(14).color(0xCCCCCC),
+                                );
+                                ui.text(
+                                    &format!("Cache: {} peers", state.cache_count),
+                                    |t| t.font_size(14).color(0xCCCCCC),
+                                );
+                                ui.text(
+                                    "Enter=broadcast  Tab=next peer  Esc=quit",
+                                    |t| t.font_size(12).color(0x777777),
+                                );
                             });
-                        // Events log (system / info / warnings — kept out of chat).
-                        ui.element().width(grow!()).height(grow!())
+                        // Events log.
+                        ui.element()
+                            .width(grow!())
+                            .height(grow!())
                             .background_color(0x1A1A1A)
                             .layout(|l| l.direction(TopToBottom).gap(2).padding(8))
-                            .overflow(|o| o.scroll_y().scrollbar(|s| s.width(4.0).thumb_color(0x666666).track_color(0x222222)))
+                            .overflow(|o| {
+                                o.scroll_y().scrollbar(|s| {
+                                    s.width(4.0)
+                                        .thumb_color(0x666666)
+                                        .track_color(0x222222)
+                                })
+                            })
                             .children(|ui| {
                                 ui.text("Events", |t| t.font_size(16).color(0xFFFFFF));
                                 for entry in &state.events {
@@ -265,9 +303,7 @@ async fn gui_main(
             });
         ui.show(|_| {}).await;
 
-        // 3. Hand-rolled text input (rustywx pattern; cookbook §7/§9).
-        //    Append printable chars; Backspace deletes. Filter control chars
-        //    (Enter/Backspace arrive here too on some platforms).
+        // 3. Text input.
         while let Some(c) = get_char_pressed() {
             if !c.is_control() {
                 state.input.push(c);
@@ -277,21 +313,14 @@ async fn gui_main(
             state.input.pop();
         }
 
-        // 4. Keyboard actions (macroquad key APIs).
-        let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+        // 4. Keyboard actions.
         if is_key_pressed(KeyCode::Tab) && !state.connected_peers.is_empty() {
-            state.selected_peer = (state.selected_peer + 1) % state.connected_peers.len();
+            state.selected_peer =
+                (state.selected_peer + 1) % state.connected_peers.len();
         }
         if is_key_pressed(KeyCode::Enter) && !state.input.is_empty() {
-            if shift {
-                let text = std::mem::take(&mut state.input);
-                let _ = action_tx.try_send(UserAction::Broadcast { text });
-            } else if let Some(p) = state.connected_peers.get(state.selected_peer) {
-                if let Ok(pid) = p.peer_id.parse::<PeerId>() {
-                    let text = std::mem::take(&mut state.input);
-                    let _ = action_tx.try_send(UserAction::SendMessage { peer_id: pid, text });
-                }
-            }
+            let text = std::mem::take(&mut state.input);
+            let _ = action_tx.try_send(UserAction::Broadcast { text });
         }
         if is_key_pressed(KeyCode::Escape) || is_quit_requested() {
             let _ = action_tx.try_send(UserAction::Quit);
@@ -304,8 +333,8 @@ async fn gui_main(
 
 #[cfg(test)]
 mod tests {
+    use super::{apply_ui_event, GuiState};
     use crate::tui::UiEvent;
-    use super::{GuiState, apply_ui_event};
 
     #[test]
     fn maps_events_to_state() {
@@ -317,26 +346,31 @@ mod tests {
         apply_ui_event(&mut s, UiEvent::LocalPeerId("x".to_string()));
         assert_eq!(s.our_peer_id, "x");
 
-        apply_ui_event(&mut s, UiEvent::NatStatus("Public".into()));
-        assert_eq!(s.nat_status, "Public");
-
         apply_ui_event(&mut s, UiEvent::PeerConnected {
-            peer_id: "12D3KooWabc".into(), addr: "/ip4/1.2.3.4/tcp/4001".into(), direct: true,
+            peer_id: "abc".into(),
+            addr: "gossip".into(),
+            direct: true,
         });
         assert_eq!(s.connected_peers.len(), 1);
         // Idempotent on duplicate peer_id.
         apply_ui_event(&mut s, UiEvent::PeerConnected {
-            peer_id: "12D3KooWabc".into(), addr: "/ip4/1.2.3.4/tcp/4001".into(), direct: true,
+            peer_id: "abc".into(),
+            addr: "gossip".into(),
+            direct: true,
         });
         assert_eq!(s.connected_peers.len(), 1);
 
-        apply_ui_event(&mut s, UiEvent::PeerDisconnected { peer_id: "12D3KooWabc".into() });
+        apply_ui_event(&mut s, UiEvent::PeerDisconnected {
+            peer_id: "abc".into(),
+        });
         assert_eq!(s.connected_peers.len(), 0);
 
-        // Chat goes to the chat buffer, not the event log.
-        apply_ui_event(&mut s, UiEvent::ChatMessage { from: "bob".into(), text: "hi".into() });
+        // Chat goes to the chat buffer.
+        apply_ui_event(&mut s, UiEvent::ChatMessage {
+            from: "bob".into(),
+            text: "hi".into(),
+        });
         assert!(s.chat.last().unwrap().text.contains("hi"));
-        // The preceding system events landed in the event buffer, not chat.
         assert_eq!(s.chat.len(), 1);
         assert!(!s.events.is_empty());
     }
@@ -356,8 +390,10 @@ mod tests {
         for i in 0..1100 {
             apply_ui_event(&mut s, UiEvent::Info(format!("evt {i}")));
         }
-        apply_ui_event(&mut s, UiEvent::ChatMessage { from: "a".into(), text: "hello".into() });
-        // Event spam is capped at 500 and never touches the chat buffer.
+        apply_ui_event(&mut s, UiEvent::ChatMessage {
+            from: "a".into(),
+            text: "hello".into(),
+        });
         assert!(s.events.len() <= 500);
         assert_eq!(s.chat.len(), 1);
     }
